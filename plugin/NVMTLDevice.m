@@ -1036,6 +1036,73 @@ static void nvmtl_busy_wait(IOSurfaceRef surf, NSUInteger plane)
         if (now - t0 > NVMTL_BUSY_WAIT_NS || (t.stamp_ns <= now && now - t.stamp_ns > NVMTL_BUSY_STALE_NS)) return;
     }
 }
+/* Each import of a surface's VRAM costs a kernel VA allocation and map, and now and then a fresh page-table level that is
+   filled on the CPU: ~9 ms on WindowServer's compositing thread, a missed refresh. WindowServer wraps the same client
+   surfaces again and again, so the import is kept per surface (the surface retained, so its ID cannot be reused) while
+   any texture uses it and for a short while after. */
+typedef struct { IOSurfaceRef surf; uint32_t id; size_t need; nvk_buffer vb; int users; uint64_t last; } nvmtl_vram_slot;
+enum { NVMTL_VRAM_SLOTS = 48 };
+static const uint64_t kVramIdleNs = 2000000000ull, kVramCapBytes = 512ull << 20;
+static nvmtl_vram_slot gVramSlot[NVMTL_VRAM_SLOTS];
+static os_unfair_lock gVramLock = OS_UNFAIR_LOCK_INIT;
+static unsigned long long gVramHits, gVramMisses;
+static int nvmtl_vram_cache_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("NVMTL_NO_VRAM_CACHE"); on = !(e && *e == '1'); } return on; }
+/* Slots leave the cache under the lock but are destroyed after it is dropped: destroying an import is a kernel call, and
+   WindowServer's compositing thread takes this lock on every wrap. */
+static void nvmtl_vram_drop(nvmtl_vram_slot *gone, int n) {
+    for (int i = 0; i < n; i++) { nvmtl_vk_buffer_destroy(&gone[i].vb); CFRelease(gone[i].surf); }
+}
+static void nvmtl_vram_evict(nvmtl_vram_slot *s, nvmtl_vram_slot *gone, int *n) { gone[(*n)++] = *s; memset(s, 0, sizeof *s); }
+static void nvmtl_vram_sweep_locked(uint64_t now, size_t room, nvmtl_vram_slot *gone, int *n) {
+    uint64_t bytes = room;
+    for (int i = 0; i < NVMTL_VRAM_SLOTS; i++) {
+        nvmtl_vram_slot *s = &gVramSlot[i];
+        if (s->surf && !s->users && now - s->last > kVramIdleNs) nvmtl_vram_evict(s, gone, n);
+        else if (s->surf) bytes += s->need;
+    }
+    while (bytes > kVramCapBytes) {
+        nvmtl_vram_slot *old = NULL;
+        for (int i = 0; i < NVMTL_VRAM_SLOTS; i++) if (gVramSlot[i].surf && !gVramSlot[i].users && (!old || gVramSlot[i].last < old->last)) old = &gVramSlot[i];
+        if (!old) return;
+        bytes -= old->need; nvmtl_vram_evict(old, gone, n);
+    }
+}
+static int nvmtl_vram_get(IOSurfaceRef surf, size_t need, nvk_buffer *out) {
+    if (!nvmtl_vram_cache_on()) return nvmtl_vk_surface_vram(IOSurfaceGetID(surf), 0, need, out);
+    const uint32_t id = IOSurfaceGetID(surf); const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    os_unfair_lock_lock(&gVramLock);
+    for (int i = 0; i < NVMTL_VRAM_SLOTS; i++) {
+        nvmtl_vram_slot *s = &gVramSlot[i];
+        if (s->surf && s->id == id && s->need == need) { s->users++; s->last = now; *out = s->vb; gVramHits++; os_unfair_lock_unlock(&gVramLock); return 0; }
+    }
+    os_unfair_lock_unlock(&gVramLock);
+    if (nvmtl_vk_surface_vram(id, 0, need, out)) return -1;
+    nvmtl_vram_slot gone[NVMTL_VRAM_SLOTS]; int ngone = 0;
+    os_unfair_lock_lock(&gVramLock);
+    const unsigned long long hits = gVramHits, misses = ++gVramMisses;
+    nvmtl_vram_sweep_locked(now, need, gone, &ngone);
+    nvmtl_vram_slot *free_ = NULL;
+    for (int i = 0; i < NVMTL_VRAM_SLOTS && !free_; i++) if (!gVramSlot[i].surf) free_ = &gVramSlot[i];
+    if (free_) { CFRetain(surf); *free_ = (nvmtl_vram_slot){ surf, id, need, *out, 1, now }; }
+    os_unfair_lock_unlock(&gVramLock);
+    nvmtl_vram_drop(gone, ngone);
+    if ((misses & (misses - 1)) == 0) nvlog("surface VRAM cache: %llu reused, %llu imported", hits, misses);
+    return 0;
+}
+/* a texture's import goes back to the cache; one the cache never held (full, or the cache is off) is destroyed */
+static void nvmtl_vram_put(nvk_buffer *vb) {
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    nvmtl_vram_slot gone[NVMTL_VRAM_SLOTS]; int ngone = 0, held = 0;
+    os_unfair_lock_lock(&gVramLock);
+    for (int i = 0; i < NVMTL_VRAM_SLOTS && !held; i++) {
+        nvmtl_vram_slot *s = &gVramSlot[i];
+        if (s->surf && s->vb.mem == vb->mem && s->vb.buf == vb->buf) { s->users--; s->last = now; held = 1; }
+    }
+    if (held) nvmtl_vram_sweep_locked(now, 0, gone, &ngone);
+    os_unfair_lock_unlock(&gVramLock);
+    nvmtl_vram_drop(gone, ngone);
+    if (!held) nvmtl_vk_buffer_destroy(vb);
+}
 static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInteger plane, uint32_t w, uint32_t h,
                                       uint32_t vkf, uint32_t bpp, int a8, int stex)
 {
@@ -1043,7 +1110,7 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
         size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf);
         if ((size_t)w * (bpp ? bpp : 4) <= row && h <= sh && row % 32 == 0) {
             nvk_buffer vb;
-            if (!nvmtl_vk_surface_vram(IOSurfaceGetID(surf), 0, row * h, &vb)) {
+            if (!nvmtl_vram_get(surf, row * h, &vb)) {
                 if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &vb, 0, row, &t->_i)) {
                     t->_vramBuf = vb; t->_vramOn = YES; g_surf_vram++;
                     uint32_t seed = IOSurfaceGetSeed(surf);
@@ -1054,7 +1121,7 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
                               w, h, row, current ? ", already current (no upload)" : "", g_surf_vram, g_surf_private);
                     return 0;
                 }
-                nvmtl_vk_buffer_destroy(&vb);
+                nvmtl_vram_put(&vb);
             }
         }
     }
