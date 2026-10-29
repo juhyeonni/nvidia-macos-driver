@@ -49,13 +49,91 @@ public:
     explicit NVRMCallReference(OSObject *object) : owner(object) {}
     ~NVRMCallReference() { owner->release(); }
 };
+// debug.nvrmfb_gate: how long each call site waited for the display gate and held it (us, totals, maxima and log-scale
+// histograms), so the time other processes' flips spend queued behind grants, releases, cursor updates and flip-done waits
+// is counted instead of inferred. Only the outermost take counts (the gate is recursive). debug.nvrmfb_gate_slow lists the
+// last 64 waits or holds of debug.nvrmfb_gate_slow_us or more, with the process and the site that held the gate meanwhile;
+// writing 1 to debug.nvrmfb_gate_reset zeroes all of it.
+enum { kGateOther, kGateGrant, kGateRelease, kGateFlip, kGateCursor, kGateCursorImage, kGateGamma, kGateReflip, kGateMode,
+       kGateHotplug, kGateSites };
+static const char *const kGateNames[kGateSites] = { "other", "grant", "release", "flip", "cursor", "cursorimage", "gamma",
+                                                    "reflip", "mode", "hotplug" };
+enum { kGateBuckets = 10 };   // < 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100 ms, and 100 ms or more
+static SInt64 gGateN[kGateSites], gGateWaitSum[kGateSites], gGateWaitMax[kGateSites], gGateHoldSum[kGateSites],
+              gGateHoldMax[kGateSites], gGateWaitHist[kGateSites][kGateBuckets], gGateHoldHist[kGateSites][kGateBuckets];
+static volatile SInt32 gGateHolder = -1;   // site holding the gate (outermost take), -1 when free
+struct NvGateSlow { uint64_t atNs; SInt64 waitUs, holdUs; SInt32 site, holder; char proc[24]; };
+enum { kGateSlowN = 64 };
+static NvGateSlow gGateSlow[kGateSlowN];
+static volatile SInt32 gGateSlowNext;
+static int gGateSlowUs = 5000, gGateSlowHoldUs = 25000;   // a frame flip holds the gate ~6 ms for its vblank wait
+static inline SInt64 nvAbsUs(uint64_t d) { uint64_t ns = 0; absolutetime_to_nanoseconds(d, &ns); return (SInt64)(ns / 1000); }
+static inline void nvStatMax(SInt64 *m, SInt64 v) { SInt64 o; while ((o = *m) < v && !OSCompareAndSwap64((UInt64)o, (UInt64)v, (volatile UInt64 *)m)) {} }
+static inline int nvGateBucket(SInt64 us)
+{
+    static const SInt64 lim[kGateBuckets - 1] = { 100, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000 };
+    for (int i = 0; i < kGateBuckets - 1; i++) if (us < lim[i]) return i;
+    return kGateBuckets - 1;
+}
+struct NvGateTake { uint64_t t0, held; int site, holder; bool outer; };
+static void nvGateEnter(IORecursiveLock *l, int site, NvGateTake *t)
+{
+    t->site = site; t->outer = !IORecursiveLockHaveLock(l); t->holder = gGateHolder;
+    t->t0 = mach_absolute_time(); IORecursiveLockLock(l); t->held = mach_absolute_time();
+    if (!t->outer) return;
+    gGateHolder = site;
+    const SInt64 w = nvAbsUs(t->held - t->t0);
+    OSAddAtomic64(1, &gGateN[site]); OSAddAtomic64(w, &gGateWaitSum[site]); nvStatMax(&gGateWaitMax[site], w);
+    OSAddAtomic64(1, &gGateWaitHist[site][nvGateBucket(w)]);
+}
+static void nvGateExit(IORecursiveLock *l, NvGateTake *t)
+{
+    if (t->outer) {
+        const SInt64 h = nvAbsUs(mach_absolute_time() - t->held), w = nvAbsUs(t->held - t->t0);
+        OSAddAtomic64(h, &gGateHoldSum[t->site]); nvStatMax(&gGateHoldMax[t->site], h);
+        OSAddAtomic64(1, &gGateHoldHist[t->site][nvGateBucket(h)]);
+        gGateHolder = -1;
+        if (w >= gGateSlowUs || h >= gGateSlowHoldUs) {
+            NvGateSlow &e = gGateSlow[(UInt32)OSIncrementAtomic(&gGateSlowNext) % kGateSlowN];
+            uint64_t ns = 0; absolutetime_to_nanoseconds(t->t0, &ns);
+            e.atNs = ns; e.waitUs = w; e.holdUs = h; e.site = t->site; e.holder = t->holder;
+            proc_selfname(e.proc, (int)sizeof e.proc);
+        }
+    }
+    IORecursiveLockUnlock(l);
+}
+// counts a raw take of the gate that keeps its own lock/unlock (the hotplug pass), as an outermost take of site
+static void nvGateNote(int site, uint64_t ask, uint64_t held)
+{
+    const SInt64 w = nvAbsUs(held - ask), h = nvAbsUs(mach_absolute_time() - held);
+    OSAddAtomic64(1, &gGateN[site]); OSAddAtomic64(w, &gGateWaitSum[site]); nvStatMax(&gGateWaitMax[site], w);
+    OSAddAtomic64(h, &gGateHoldSum[site]); nvStatMax(&gGateHoldMax[site], h);
+    OSAddAtomic64(1, &gGateWaitHist[site][nvGateBucket(w)]); OSAddAtomic64(1, &gGateHoldHist[site][nvGateBucket(h)]);
+}
 class NVRMDisplayGate {
-    IORecursiveLock *lock;
+    IORecursiveLock *lock; NvGateTake take;
 public:
-    NVRMDisplayGate() : lock(startLock()) { if (lock) IORecursiveLockLock(lock); }
-    ~NVRMDisplayGate() { if (lock) IORecursiveLockUnlock(lock); }
+    explicit NVRMDisplayGate(int s = kGateOther) : lock(startLock()), take() { if (lock) nvGateEnter(lock, s, &take); }
+    ~NVRMDisplayGate() { if (lock) nvGateExit(lock, &take); }
     bool valid() const { return lock != nullptr; }
 };
+// 1 = a grant's CPU zero (94% of the time a grant held the display gate, up to 58 ms) runs with the gate dropped; the memory
+// is known to no one else until it is published under the gate again, and the NVKMS device is never freed. 0 = the old way.
+static int gGrantZeroUnlocked = 1;
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_grant_zero_unlocked, CTLFLAG_RW | CTLFLAG_LOCKED, &gGrantZeroUnlocked, 0,
+           "1 = zero a new VRAM grant with the display gate dropped");
+// 1 = a cached flip surface whose allocation cookie matches is reused across grants and releases: the cookie is never issued
+// twice, so it already tells a reused NvKmsKapiMemory address apart, and the epoch (bumped by every grant and release) threw
+// away the whole cache 160-200 times per Brave Maps run (56% of misses). Memory without a cookie still needs the epoch.
+// 1 = a released grant is unmapped (the BAR1 unmap took up to 31 ms) and freed after the display gate is dropped; it is taken out of gAllocations under it.
+static int gReleaseUnlocked = 1;
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_release_unlocked, CTLFLAG_RW | CTLFLAG_LOCKED, &gReleaseUnlocked, 0,
+           "1 = unmap and free a released VRAM grant with the display gate dropped");
+static int gFlipCookieMatch = 1;
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_cookie_match, CTLFLAG_RW | CTLFLAG_LOCKED, &gFlipCookieMatch, 0,
+           "1 = flip cache entries with an allocation cookie survive grants and releases");
+static SInt64 gRelUnmapUs, gRelUnmapMax, gRelFreeUs, gRelFreeMax;
+static SInt64 gFlipCacheHit, gFlipCacheMiss, gFlipRebuildUs, gFlipRebuildMax, gGrantZeroN, gGrantZeroUs, gGrantZeroMax;
 static NVRMAllocationTable<struct NvKmsKapiMemory, 4096> gAllocations;
 // The bundled NVKMS headers emit conversion warnings; keep them scoped to these external declarations.
 #pragma clang diagnostic push
@@ -1550,7 +1628,9 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
     NVRMNVDAFramebuffer *relight[16]; unsigned nrelight = 0;
     NVRMNVDAFramebuffer *notify[16]; unsigned nnotify = 0;
     IORecursiveLock *sl = startLock();
+    const uint64_t hpAsk = mach_absolute_time();
     if (sl) IORecursiveLockLock(sl);
+    const uint64_t hpHeld = mach_absolute_time();
     for (NvU32 i = 0; i < n; i++) {
         bool known = false; int kdpy = -1;
         for (int k = 0; k < gNDpy; k++) if (gDpy[k].handle == handles[i]) { known = true; kdpy = k; break; }
@@ -1645,6 +1725,7 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
     }
     for (unsigned i = 0; i < sizeof gFBs / sizeof gFBs[0]; ++i)
         if (gFBs[i] && !gFBs[i]->fDpyLost) gFBs[i]->publishDisplayAudioProperties();
+    if (sl) nvGateNote(kGateHotplug, hpAsk, hpHeld);
     if (sl) IORecursiveLockUnlock(sl);
     IOFree(dd, sizeof *dd);
     for (unsigned f = 0; f < nnotify; f++) {
@@ -1994,7 +2075,7 @@ void NVRMNVDAFramebuffer::sampleFire(thread_call_param_t p0, thread_call_param_t
 }
 bool NVRMNVDAFramebuffer::reflip()
 {
-    NVRMDisplayGate gate; if (!gate.valid()) return false;
+    NVRMDisplayGate gate(kGateReflip); if (!gate.valid()) return false;
     if (!fKms || !fDev || !fSurf) return false;
     struct NvKmsKapiSurface *front = fFrontSurf ? fFrontSurf : fSurf;
     struct NvKmsKapiRequestedModeSetConfig *cfg =
@@ -2120,7 +2201,7 @@ IOReturn NVRMNVDAFramebuffer::nvrmSetGamma(UInt32 channels, UInt32 count, UInt32
     fGammaOn = true;
     // Not lit yet (boot, display sleep, GPU in standby, console aperture): the next modeset carries the table.
     if (!fModeSet || !fSurf || fHeadSlept || fConsoleAperture || !rmGpuReady()) return kIOReturnSuccess;
-    NVRMDisplayGate gate; if (!gate.valid() || !fKms || !fDev) return kIOReturnSuccess;
+    NVRMDisplayGate gate(kGateGamma); if (!gate.valid() || !fKms || !fDev) return kIOReturnSuccess;
     struct NvKmsKapiRequestedModeSetConfig *cfg = (struct NvKmsKapiRequestedModeSetConfig *)IOMalloc(sizeof *cfg);
     struct NvKmsKapiModeSetReplyConfig *rep = (struct NvKmsKapiModeSetReplyConfig *)IOMalloc(sizeof *rep);
     if (!cfg || !rep) { if (cfg) IOFree(cfg, sizeof *cfg); if (rep) IOFree(rep, sizeof *rep); return kIOReturnSuccess; }
@@ -2247,7 +2328,7 @@ bool NVRMNVDAFramebuffer::cursorInit()
 }
 bool NVRMNVDAFramebuffer::cursorApply(bool imageChanged)
 {
-    NVRMDisplayGate gate; if (!gate.valid()) return false;
+    NVRMDisplayGate gate(kGateCursor); if (!gate.valid()) return false;
     if (!fKms || !fDev || !fCurSurf || !fModeSet) return false;
     struct NvKmsKapiRequestedModeSetConfig *cfg =
         (struct NvKmsKapiRequestedModeSetConfig *)IOMalloc(sizeof *cfg);
@@ -2318,7 +2399,7 @@ static bool nvrmPackCursor(UInt32 *dst, unsigned dim, const UInt32 *src,
 IOReturn NVRMNVDAFramebuffer::setCursorImage(void *cursorImage)
 {
     if (!fCurKva || !fCurSurf) return kIOReturnUnsupported;
-    NVRMDisplayGate gate; if (!gate.valid()) return kIOReturnUnsupported;
+    NVRMDisplayGate gate(kGateCursorImage); if (!gate.valid()) return kIOReturnUnsupported;
     return setCursorImageLocked(cursorImage);
 }
 IOReturn NVRMNVDAFramebuffer::setCursorImageLocked(void *cursorImage)
@@ -2527,7 +2608,7 @@ void NVRMNVDAFramebuffer::vblFire(thread_call_param_t p0, thread_call_param_t)
 }
 bool NVRMNVDAFramebuffer::setHeadActive(bool active)
 {
-    NVRMDisplayGate gate; if (!gate.valid()) return false;
+    NVRMDisplayGate gate(kGateMode); if (!gate.valid()) return false;
     if (!fKms || !fDev) return false;
     struct NvKmsKapiRequestedModeSetConfig *cfg = (struct NvKmsKapiRequestedModeSetConfig *)IOMalloc(sizeof *cfg);
     struct NvKmsKapiModeSetReplyConfig *rep = (struct NvKmsKapiModeSetReplyConfig *)IOMalloc(sizeof *rep);
@@ -2577,7 +2658,7 @@ void NVRMNVDAFramebuffer::headProbeFire(thread_call_param_t p0, thread_call_para
 }
 bool NVRMNVDAFramebuffer::applyMode()
 {
-    NVRMDisplayGate gate; if (!gate.valid()) return false;
+    NVRMDisplayGate gate(kGateMode); if (!gate.valid()) return false;
     if (fConsoleAperture) {
         FBLOG("applyMode: skipped (console aperture mode -- the GOP drives this panel)");
         fModeSet = true; return true;
@@ -2747,7 +2828,7 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     setName("NVRMFramebuffer");
     if (fInternal) publishBacklight();   // before super::start(): IOFramebuffer::open looks for "backlight"
     if (!super::start(provider)) {
-        NVRMDisplayGate gate; if (gate.valid() && fOwnsHead) { gHeadsTaken &= ~(1u << fHead); fOwnsHead = false; }
+        NVRMDisplayGate gate(kGateMode); if (gate.valid() && fOwnsHead) { gHeadsTaken &= ~(1u << fHead); fOwnsHead = false; }
         FBLOG("super::start failed after kapiInit succeeded"); return false;
     }
     fSleepTap = addFramebufferNotification(&NVRMNVDAFramebuffer::sleepTap, this, nullptr);
@@ -3184,7 +3265,7 @@ int NVRMNVDAFramebuffer::dtIndex(IODisplayModeID id) const
 }
 IOReturn NVRMNVDAFramebuffer::switchMode(IODisplayModeID id, const struct NvKmsKapiDisplayMode &m, NvU32 w, NvU32 h, UInt32 transform)
 {
-    NVRMDisplayGate gate; if (!gate.valid()) return kIOReturnNoMemory;
+    NVRMDisplayGate gate(kGateMode); if (!gate.valid()) return kIOReturnNoMemory;
     if (fSubmissionFaulted) return kIOReturnNotReady;
     if (!fKms || !fDev || !fMem || fConsoleAperture) return kIOReturnNotReady;
     NvU32 pitch = 0;
@@ -3618,10 +3699,75 @@ SYSCTL_INT(_debug, OID_AUTO, nvrmfb_flip_interval, CTLFLAG_RW | CTLFLAG_LOCKED, 
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_flip_us_sum, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gFlipUsSum, "microseconds spent in pure-flip applyModeSetConfig");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_flip_n, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gFlipN, "pure flips timed");
 SYSCTL_QUAD(_debug, OID_AUTO, nvrmfb_flip_us_max, CTLFLAG_RD | CTLFLAG_LOCKED, (SInt64 *)&gFlipUsMax, "the slowest pure flip, us");
+static int nvrmfbGateSysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+    const size_t cap = 4096; char *buf = (char *)IOMalloc(cap); if (!buf) return ENOMEM;
+    int n = snprintf(buf, cap, "site n wait_us_sum wait_us_max hold_us_sum hold_us_max | wait hist | hold hist "
+                               "(<0.1 <0.5 <1 <2 <5 <10 <20 <50 <100 >=100 ms)\n");
+    for (int i = 0; i < kGateSites && n < (int)cap; i++) {
+        n += snprintf(buf + n, cap - (size_t)n, "%s %lld %lld %lld %lld %lld |", kGateNames[i], (long long)gGateN[i],
+                      (long long)gGateWaitSum[i], (long long)gGateWaitMax[i], (long long)gGateHoldSum[i], (long long)gGateHoldMax[i]);
+        for (int k = 0; k < kGateBuckets && n < (int)cap; k++) n += snprintf(buf + n, cap - (size_t)n, " %lld", (long long)gGateWaitHist[i][k]);
+        if (n < (int)cap) n += snprintf(buf + n, cap - (size_t)n, " |");
+        for (int k = 0; k < kGateBuckets && n < (int)cap; k++) n += snprintf(buf + n, cap - (size_t)n, " %lld", (long long)gGateHoldHist[i][k]);
+        if (n < (int)cap) n += snprintf(buf + n, cap - (size_t)n, "\n");
+    }
+    if (n < (int)cap)
+        n += snprintf(buf + n, cap - (size_t)n, "flipcache hit %lld miss %lld rebuild_us_sum %lld rebuild_us_max %lld\n"
+                      "grantzero n %lld us_sum %lld us_max %lld\nrelease unmap_us_sum %lld unmap_us_max %lld free_us_sum %lld free_us_max %lld\n",
+                      (long long)gFlipCacheHit, (long long)gFlipCacheMiss, (long long)gFlipRebuildUs, (long long)gFlipRebuildMax,
+                      (long long)gGrantZeroN, (long long)gGrantZeroUs, (long long)gGrantZeroMax,
+                      (long long)gRelUnmapUs, (long long)gRelUnmapMax, (long long)gRelFreeUs, (long long)gRelFreeMax);
+    const int r = SYSCTL_OUT(req, buf, strlen(buf) + 1);
+    IOFree(buf, cap);
+    return r;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nvrmfb_gate, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, nvrmfbGateSysctl, "A",
+            "display gate wait/hold per call site with histograms, flip cache hits/misses, grant zero and release times");
+static int nvrmfbGateSlowSysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+    const size_t cap = 8192; char *buf = (char *)IOMalloc(cap); if (!buf) return ENOMEM;
+    int n = snprintf(buf, cap, "at_ns site holder wait_us hold_us proc\n");
+    const UInt32 next = (UInt32)gGateSlowNext;
+    for (UInt32 k = 0; k < kGateSlowN && n < (int)cap; k++) {
+        const NvGateSlow &e = gGateSlow[(next + k) % kGateSlowN];
+        if (!e.atNs) continue;
+        n += snprintf(buf + n, cap - (size_t)n, "%llu %s %s %lld %lld %s\n", (unsigned long long)e.atNs,
+                      e.site >= 0 && e.site < kGateSites ? kGateNames[e.site] : "?",
+                      e.holder >= 0 && e.holder < kGateSites ? kGateNames[e.holder] : "-", (long long)e.waitUs, (long long)e.holdUs, e.proc);
+    }
+    const int r = SYSCTL_OUT(req, buf, strlen(buf) + 1);
+    IOFree(buf, cap);
+    return r;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nvrmfb_gate_slow, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, nvrmfbGateSlowSysctl, "A",
+            "the last 64 display gate waits or holds of nvrmfb_gate_slow_us or more (mach absolute time in ns)");
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_gate_slow_us, CTLFLAG_RW | CTLFLAG_LOCKED, &gGateSlowUs, 0, "wait threshold for nvrmfb_gate_slow, us");
+SYSCTL_INT(_debug, OID_AUTO, nvrmfb_gate_slow_hold_us, CTLFLAG_RW | CTLFLAG_LOCKED, &gGateSlowHoldUs, 0, "hold threshold for nvrmfb_gate_slow, us");
+static int nvrmfbGateResetSysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+    int v = 0; const int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || !req->newptr || v != 1) return err;
+    bzero(gGateN, sizeof gGateN); bzero(gGateWaitSum, sizeof gGateWaitSum); bzero(gGateWaitMax, sizeof gGateWaitMax);
+    bzero(gGateHoldSum, sizeof gGateHoldSum); bzero(gGateHoldMax, sizeof gGateHoldMax);
+    bzero(gGateWaitHist, sizeof gGateWaitHist); bzero(gGateHoldHist, sizeof gGateHoldHist); bzero(gGateSlow, sizeof gGateSlow);
+    gFlipCacheHit = gFlipCacheMiss = gFlipRebuildUs = gFlipRebuildMax = gGrantZeroN = gGrantZeroUs = gGrantZeroMax = 0;
+    gRelUnmapUs = gRelUnmapMax = gRelFreeUs = gRelFreeMax = 0;
+    return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, nvrmfb_gate_reset, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, nvrmfbGateResetSysctl, "I",
+            "write 1 to zero the display gate counters and the slow-event list");
 static bool gFbSysctl = false;
 static void nvrmfbInstallSysctl(void)
 {
     if (gFbSysctl) return; gFbSysctl = true;
+    sysctl_register_oid(&sysctl__debug_nvrmfb_gate); sysctl_register_oid(&sysctl__debug_nvrmfb_grant_zero_unlocked);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_flip_cookie_match); sysctl_register_oid(&sysctl__debug_nvrmfb_gate_slow);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_gate_slow_us); sysctl_register_oid(&sysctl__debug_nvrmfb_gate_reset);
+    sysctl_register_oid(&sysctl__debug_nvrmfb_release_unlocked); sysctl_register_oid(&sysctl__debug_nvrmfb_gate_slow_hold_us);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_grants);   sysctl_register_oid(&sysctl__debug_nvrmfb_vram_grant_bytes);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_releases); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_release_bytes);
     sysctl_register_oid(&sysctl__debug_nvrmfb_vram_mapped_bytes); sysctl_register_oid(&sysctl__debug_nvrmfb_vram_budget_bytes);
@@ -3635,20 +3781,36 @@ static void nvrmfbInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_late); sysctl_register_oid(&sysctl__debug_nvrmfb_flip_latch_deferred);
 }
 
+// Zeroes a fresh grant through its BAR1 mapping and checks the aperture is live (a write read back). True when it is.
+static bool nvGrantZeroProbe(void *kva, NvU64 want)
+{
+    const uint64_t z0 = mach_absolute_time(); nvu_zero_wide(kva, (size_t)want);
+    const SInt64 us = nvAbsUs(mach_absolute_time() - z0);
+    OSAddAtomic64(1, &gGrantZeroN); OSAddAtomic64(us, &gGrantZeroUs); nvStatMax(&gGrantZeroMax, us);
+    volatile NvU64 *q = (volatile NvU64 *)kva;
+    q[0] = 0x5A5AA5A5C0FFEE01ull;
+    const NvU64 back = q[0];
+    q[0] = 0;
+    return back == 0x5A5AA5A5C0FFEE01ull;
+}
 bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
 {
-    NVRMDisplayGate gate; if (!gate.valid()) return false;
+    NvU64 want = 0; SInt64 budget = 0, before = 0;
+    struct NvKmsKapiMemory *mem = nullptr; void *kva = nullptr; NvU64 phys = 0;
+    int zeroed = -1;   // -1 not yet, 0 aperture dead, 1 zeroed
+    {
+    NVRMDisplayGate gate(kGateGrant); if (!gate.valid()) return false;
     nvrmfbInstallSysctl();
     r->phys = 0; r->kva = nullptr; r->handle = nullptr; r->actualSize = 0; r->mappedTotal = 0;
     if (!fKms || !fDev) { FBLOG("nvAllocVram: no NVKMS device yet"); return false; }
-    NvU64 want = (r->size + 0xFFFFull) & ~0xFFFFull;
+    want = (r->size + 0xFFFFull) & ~0xFFFFull;
     if (!want) return false;
 
-    const SInt64 budget = (SInt64)nvrmSurfaceBudget(fBarLen, gVramDisplayBytes);
+    budget = (SInt64)nvrmSurfaceBudget(fBarLen, gVramDisplayBytes);
     gVramBudgetBytes = budget;
     // Parked blocks keep their BAR1 mapping (see below), so they count against the budget. On a 256 MB BAR1 (every
     // GTX 16, boards without Resizable BAR) the park ceiling is the smaller one, so surfaces keep most of the budget.
-    SInt64 before = OSAddAtomic64((SInt64)want, &gVramMappedBytes) + gVramParkedBytes;
+    before = OSAddAtomic64((SInt64)want, &gVramMappedBytes) + gVramParkedBytes;
     if (before + (SInt64)want > budget) {
         OSAddAtomic64(-(SInt64)want, &gVramMappedBytes);
         // A full 256 MB window is refused thousands of times in a session (one size, retried every frame: 1,413 lines in
@@ -3669,8 +3831,6 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
                   (long long)budget, (unsigned long long)fBarLen);
         return false;
     }
-
-    struct NvKmsKapiMemory *mem = nullptr; void *kva = nullptr; NvU64 phys = 0;
 
     for (int attempt = 0; attempt < 8 && !mem; attempt++) {
         struct NvKmsKapiAllocateMemoryParams mp; nvu_zero(&mp, sizeof mp);
@@ -3774,15 +3934,21 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
         return false;
     }
 
-    nvu_zero_wide(kva, (size_t)want);
-    volatile NvU64 *q = (volatile NvU64 *)kva;
-    q[0] = 0x5A5AA5A5C0FFEE01ull;
-    NvU64 back = q[0];
-    q[0] = 0;
-    if (back != 0x5A5AA5A5C0FFEE01ull) {
-        FBLOG("nvAllocVram(%llu): kva %s phys <phys> WROTE 0x5A5AA5A5C0FFEE01 AND READ 0x%llx — "
+    if (!gGrantZeroUnlocked) zeroed = nvGrantZeroProbe(kva, want) ? 1 : 0;
+    }
+    if (zeroed < 0) zeroed = nvGrantZeroProbe(kva, want) ? 1 : 0;
+    NVRMDisplayGate gate(kGateGrant);
+    // The gate and the NVKMS device outlive any grant (startLock is made once and fKms/fDev are never cleared); a grant
+    // that finds either gone gives its memory back rather than leak it and the BAR1 bytes it reserved.
+    if (!gate.valid() || !fKms || !fDev) {
+        if (fKms && fDev) { fKms->unmapMemory(fDev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, kva); fKms->freeMemory(fDev, mem); }
+        OSAddAtomic64(-(SInt64)want, &gVramMappedBytes);
+        return false;
+    }
+    if (!zeroed) {
+        FBLOG("nvAllocVram(%llu): kva %s phys <phys> WROTE 0x5A5AA5A5C0FFEE01 AND READ IT BACK WRONG — "
               "the aperture is not live; refusing to hand this out",
-              (unsigned long long)want, kva ? "set" : "null", (unsigned long long)back);
+              (unsigned long long)want, kva ? "set" : "null");
         fKms->unmapMemory(fDev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, kva);
         fKms->freeMemory(fDev, mem);
         OSAddAtomic64(-(SInt64)want, &gVramMappedBytes);
@@ -3808,15 +3974,29 @@ bool NVRMNVDAFramebuffer::vramGrant(struct NVRMVramRequest *r)
     return true;
 }
 
+static void nvReleaseMemory(struct NvKmsKapiFunctionsTable *kms, struct NvKmsKapiDevice *dev, struct NvKmsKapiMemory *mem, void *kva)
+{
+    const uint64_t u0 = mach_absolute_time();
+    if (kva) kms->unmapMemory(dev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, kva);
+    const uint64_t f0 = mach_absolute_time();
+    kms->freeMemory(dev, mem);
+    const SInt64 um = nvAbsUs(f0 - u0), fr = nvAbsUs(mach_absolute_time() - f0);
+    OSAddAtomic64(um, &gRelUnmapUs); nvStatMax(&gRelUnmapMax, um); OSAddAtomic64(fr, &gRelFreeUs); nvStatMax(&gRelFreeMax, fr);
+}
 bool NVRMNVDAFramebuffer::vramRelease(struct NVRMVramRequest *r)
 {
-    NVRMDisplayGate gate; if (!gate.valid()) return false;
     struct NvKmsKapiMemory *mem = (struct NvKmsKapiMemory *)r->handle;
-    if (!mem || !fKms || !fDev) return false;
-    if (!gAllocations.remove(mem, r->allocationCookie)) return false;
-    advanceFlipEpoch();   // every cached surface made before this free stops matching (see gFlipEpoch)
-    if (r->kva) fKms->unmapMemory(fDev, mem, NVKMS_KAPI_MAPPING_TYPE_KERNEL, r->kva);
-    fKms->freeMemory(fDev, mem);
+    const bool unlocked = gReleaseUnlocked != 0;
+    {
+        NVRMDisplayGate gate(kGateRelease); if (!gate.valid()) return false;
+        if (!mem || !fKms || !fDev) return false;
+        if (!gAllocations.remove(mem, r->allocationCookie)) return false;
+        advanceFlipEpoch();   // every cached surface made before this free stops matching (see gFlipEpoch)
+        if (!unlocked) nvReleaseMemory(fKms, fDev, mem, r->kva);
+    }
+    // Once removed, no flip can name this memory (flipToMemory checks gAllocations under the gate) and a cached flip
+    // surface holds its own dupMemory pin, so the unmap and free (once 391 ms under the gate) need not hold it.
+    if (unlocked) nvReleaseMemory(fKms, fDev, mem, r->kva);
     if (r->actualSize) OSAddAtomic64(-(SInt64)r->actualSize, &gVramMappedBytes);
     OSAddAtomic64(1, &gCntRelease); OSAddAtomic64((SInt64)r->actualSize, &gCntReleaseBytes);
     r->handle = nullptr; r->kva = nullptr; r->phys = 0; r->actualSize = 0; r->allocationCookie = 0;
@@ -3908,7 +4088,7 @@ IOReturn NVRMNVDAFramebuffer::callPlatformFunction(const OSSymbol *functionName,
 bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, unsigned h,
                                    unsigned pitch, int *rcOut, bool pure, UInt64 cookie)
 {
-    NVRMDisplayGate gate; if (!gate.valid() || fSubmissionFaulted) return false;
+    NVRMDisplayGate gate(kGateFlip); if (!gate.valid() || fSubmissionFaulted) return false;
     if (mem) {
         const UInt64 bytes = gAllocations.size(mem, cookie);
         if (!bytes || !w || !h || w > 65535 || h > 65535 || (UInt64)w * 4 > pitch || (UInt64)pitch * h > bytes) return false;
@@ -3934,9 +4114,10 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
         // over the reallocated memory, which strobes the panel black every other frame after a refresh or resolution
         // change. Requiring the current epoch makes a reused address always take a fresh surface.
         for (unsigned i = 0; i < fFlipCacheN; i++)
-            if (fFlipCache[i].epoch == epoch && fFlipCache[i].cookie == cookie && fFlipCache[i].mem == mem &&
+            if ((fFlipCache[i].epoch == epoch || (gFlipCookieMatch && cookie)) && fFlipCache[i].cookie == cookie && fFlipCache[i].mem == mem &&
                 fFlipCache[i].pitch == pitch && fFlipCache[i].w == w && fFlipCache[i].h == h) { surf = fFlipCache[i].surf; break; }
         IOSimpleLockUnlockEnableInterrupt(fFlipCacheLock, state);
+        OSAddAtomic64(1, surf ? &gFlipCacheHit : &gFlipCacheMiss);
     }
     if (!surf) {
         // Prior accepted submissions complete before returning; no non-front cache entry is in flight.
@@ -3963,6 +4144,7 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
             if (entry.pin) fKms->freeMemory(fDev, entry.pin);
             entry = {};
         }
+        const uint64_t rb0 = mach_absolute_time();
         struct NvKmsKapiMemory *pin = fKms->dupMemory(fDev, fDev, mem);
         if (!pin) return false;
         struct NvKmsKapiCreateSurfaceParams sp = {};
@@ -3970,6 +4152,7 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
         sp.width = w; sp.height = h; sp.format = NvKmsSurfaceMemoryFormatX8R8G8B8;
         surf = fKms->createSurface(fDev, &sp);
         if (!surf) { fKms->freeMemory(fDev, pin); return false; }
+        { const SInt64 us = nvAbsUs(mach_absolute_time() - rb0); OSAddAtomic64(us, &gFlipRebuildUs); nvStatMax(&gFlipRebuildMax, us); }
         entry.mem = mem; entry.surf = surf; entry.pin = pin; entry.cookie = cookie; entry.epoch = epoch;
         entry.w = w; entry.h = h; entry.pitch = pitch;
         if (slot >= fFlipCacheN) fFlipCacheN = slot + 1;
@@ -4154,7 +4337,7 @@ IOReturn NVRMNVDAFramebuffer::getAttributeForConnection(IOIndex connectIndex, IO
 // and never went to standby (issue #90). -nvrmnodpms restores the old behaviour.
 bool NVRMNVDAFramebuffer::headOff()
 {
-    NVRMDisplayGate gate; if (!gate.valid()) return false;
+    NVRMDisplayGate gate(kGateMode); if (!gate.valid()) return false;
     if (!fKms || !fDev) return false;
     struct NvKmsKapiRequestedModeSetConfig *cfg = (struct NvKmsKapiRequestedModeSetConfig *)IOMalloc(sizeof *cfg);
     struct NvKmsKapiModeSetReplyConfig *rep = (struct NvKmsKapiModeSetReplyConfig *)IOMalloc(sizeof *rep);
@@ -4172,7 +4355,7 @@ bool NVRMNVDAFramebuffer::headOff()
 }
 bool NVRMNVDAFramebuffer::setHeadPower(bool awake)
 {
-    NVRMDisplayGate gate; if (!gate.valid()) return false;
+    NVRMDisplayGate gate(kGateMode); if (!gate.valid()) return false;
     char nb[8] = { 0 };
     const bool dpms = !PE_parse_boot_argn("-nvrmnodpms", nb, sizeof nb);
     if (OSAddAtomic(0, &fStopping)) return false;
@@ -4314,7 +4497,7 @@ void NVRMNVDAFramebuffer::gpuWakeFire(thread_call_param_t p0, thread_call_param_
     NVRMNVDAFramebuffer *me = (NVRMNVDAFramebuffer *)p0;
     NVRMCallReference callReference(me);
     if (OSAddAtomic(0, &me->fStopping)) return;
-    NVRMDisplayGate gate; if (!gate.valid()) return;
+    NVRMDisplayGate gate(kGateMode); if (!gate.valid()) return;
     if (!me->fHeadSlept || !me->fPowerOn || !me->fModeSet || !me->fSurf) {
         FBLOG("GPU back: head %u left as is (slept %u, power %u)", me->fHead, (unsigned)me->fHeadSlept, (unsigned)me->fPowerOn);
         return;

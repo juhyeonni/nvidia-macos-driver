@@ -24,8 +24,10 @@ struct IOService {};
 enum { kIOPMAckImplied=0, kIOFBNotifyDidPowerOn=1, kIOFBNotifyWillPowerOff=2 };
 static bool disabled=false, lockAvailable=true;
 static std::recursive_mutex displayLock;
+enum { kGateOther, kGateGrant, kGateRelease, kGateFlip, kGateCursor, kGateCursorImage, kGateGamma, kGateReflip, kGateMode,
+       kGateHotplug };
 struct NVRMDisplayGate {
-    NVRMDisplayGate() { displayLock.lock(); }
+    explicit NVRMDisplayGate(int site = kGateOther) { (void)site; displayLock.lock(); }
     ~NVRMDisplayGate() { displayLock.unlock(); }
     bool valid() { return lockAvailable; }
 };
