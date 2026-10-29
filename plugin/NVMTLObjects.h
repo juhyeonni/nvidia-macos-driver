@@ -21,6 +21,7 @@ static inline NSMutableData *nvmtl_fc_storage(NSUInteger count) {
     void *_hostPtr; size_t _hostLen; id _hostDealloc;
     NVMTLHeap *_subHeap; NSUInteger _subCharge; BOOL _aliased;
     nvk_buffer _shadow; int _syncOut; int _zshadow;
+    int _shadowHeap;   // the shadow is ordinary process memory (calloc), staged through the pool to and from _b
     NSUInteger _dirtyLo, _dirtyHi; } @end
 #include <sched.h>
 static inline void nvmtl_buf_settle(NVMTLBuffer *b) {
@@ -31,6 +32,7 @@ static inline void nvmtl_buf_settle(NVMTLBuffer *b) {
         __atomic_store_n(&b->_zshadow, 0, __ATOMIC_RELEASE); return; }
     while (__atomic_load_n(&b->_zshadow, __ATOMIC_ACQUIRE) == 2) sched_yield();
 }
+int nvmtl_managed_heap_shadow(NVMTLBuffer *b, size_t len);
 static inline void *nvmtl_buf_cpu(NVMTLBuffer *b) { nvmtl_buf_settle(b); return b->_shadow.map ? b->_shadow.map : b->_b.map; }
 @interface NVMTLTexture : NSObject <MTLTexture> {
   @public nvk_image _i; nvk_queue *_q; IOSurfaceRef _surf; MTLPixelFormat _fmt; NSUInteger _plane;

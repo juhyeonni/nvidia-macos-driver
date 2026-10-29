@@ -738,7 +738,8 @@ static __thread int gZeroSkip;
         if (nvmtl_vk_buffer_create(len, 1, &b->_b)) { nvmtl_alloc_failed("newBufferWithLength"); nvlog("newBufferWithLength: FAILED"); return nil; }
     }
     nvmtl_alloc_ok();
-    if (b->_storage == MTLStorageModeManaged && !b->_b.map && nvmtl_vk_buffer_create(len, 1, &b->_shadow)) {
+    if (b->_storage == MTLStorageModeManaged && !b->_b.map && nvmtl_managed_heap_shadow(b, len)) {
+    } else if (b->_storage == MTLStorageModeManaged && !b->_b.map && nvmtl_vk_buffer_create(len, 1, &b->_shadow)) {
         nvlog("newBufferWithLength:%lu managed: shadow refused - placing it in system memory", (unsigned long)len);
         memset(&b->_shadow, 0, sizeof b->_shadow); nvmtl_vk_buffer_destroy(&b->_b);
         if (nvmtl_vk_buffer_create(len, 1, &b->_b)) { nvmtl_alloc_failed("newBufferWithLength"); return nil; }

@@ -25,9 +25,14 @@ fixture = r'''
 #include <string.h>
 typedef struct { void *map; size_t size; } Buffer;
 @interface NVMTLBuffer : NSObject { @public
-    void *_hostPtr; size_t _hostLen; Buffer _b, _shadow; unsigned _syncOut, _zshadow;
+    void *_hostPtr; size_t _hostLen; Buffer _b, _shadow; unsigned _syncOut, _zshadow; int _shadowHeap;
 } @end
 @implementation NVMTLBuffer @end
+// a heap shadow (ordinary memory) reads back through a staging buffer the size of _b
+@interface NVMTLStaging : NSObject { @public Buffer b; } @end
+@implementation NVMTLStaging @end
+static unsigned char stagingBytes[64];
+static NVMTLStaging *nvmtl_staging(size_t n) { NVMTLStaging *st = [NVMTLStaging new]; st->b = (Buffer){stagingBytes, n}; return st; }
 @interface NVMTLTexture : NSObject { @public
     NVMTLBuffer *_backBuf; NVMTLTexture *_parent; MTLTextureUsage _usage;
     IOSurfaceRef _surf; NSUInteger _plane; BOOL _vramOn; int _tag;

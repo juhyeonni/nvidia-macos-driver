@@ -468,7 +468,7 @@ static Class gNVMTLBufClass;
 static BOOL nvmtl_res3_movable(NVMTLBuffer *b) {
     if (!gNVMTLBufClass) gNVMTLBufClass = [NVMTLBuffer class];
     return object_getClass(b) == gNVMTLBufClass && b->_storage == MTLStorageModePrivate && b->_b.sparse && b->_b.buf && b->_b.mem
-        && !b->_b.map && !b->_heap && !b->_subHeap && !b->_hostPtr && !b->_shadow.buf && !b->_texSeen && !b->_nbpk && !b->_subPlaced
+        && !b->_b.map && !b->_heap && !b->_subHeap && !b->_hostPtr && !b->_shadow.map && !b->_texSeen && !b->_nbpk && !b->_subPlaced
         && !b->_b.pool && !b->_b.placed && !b->_b.imported && !b->_b.bar1 && !b->_b.moff;
 }
 static void nvmtl_res3_note_use(NVMTLBuffer *b) {
@@ -624,6 +624,30 @@ static void nvmtl_purge_report(const char *why) {
           (unsigned long long)atomic_load(&gPurgeAsks), (unsigned long long)(bemp >> 20));
 }
 static void nvmtl_pre_release(void *held) { @autoreleasepool { (void)CFBridgingRelease(held); } }
+// A Managed buffer of 1 MB or less keeps its CPU copy in ordinary memory: every kernel-allocated shadow cost RM a wired,
+// zeroed 8 MB pool block per ~8 MB of buffers (3.2 ms each, half of each Google Maps stall, and RM-lock time other
+// processes waited on). Uploads and synchronizeResource go through short-lived staging ranges from the system-memory pool,
+// which a steady stream reuses without new kernel allocations. NVMTL_MANAGED_HEAP_SHADOW=0 keeps the old shadow.
+@interface NVMTLStaging : NSObject { @public nvk_buffer b; } @end
+@implementation NVMTLStaging
+- (void)dealloc { nvmtl_vk_buffer_destroy(&b); }
+@end
+static NVMTLStaging *nvmtl_staging(size_t n) {
+    NVMTLStaging *st = [NVMTLStaging new];
+    if (nvmtl_vk_buffer_create(n, 1, &st->b) || !st->b.map) { memset(&st->b, 0, sizeof st->b); return nil; }
+    return st;
+}
+int nvmtl_managed_heap_shadow(NVMTLBuffer *b, size_t len) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_MANAGED_HEAP_SHADOW"); on = !(e && e[0] == '0'); }
+    // 1 MB or less, the size ANGLE uploads map tiles in. A burst of same-size 4 MB buffers dropped and made again (300 per
+    // 0.7 s) is served by the pool and the buffer park; as ordinary memory it unmapped and refaulted 1.2 GB per burst, and
+    // other processes missed 6-8 frames per 9 s instead of 1-2.
+    if (!on || !len || len > (1u << 20)) return 0;
+    void *p = calloc(1, len); if (!p) return 0;
+    memset(&b->_shadow, 0, sizeof b->_shadow); b->_shadow.map = p; b->_shadow.size = len; b->_shadowHeap = 1;
+    return 1;
+}
 static void nvmtl_managed_flush(void) {
     if (!atomic_load(&gManagedAny) || gManagedInFlush) return;
     gManagedInFlush = 1;
@@ -636,17 +660,31 @@ static void nvmtl_managed_flush(void) {
     [gManagedDirty removeAllObjects]; atomic_store(&gManagedAny, 0);
     os_unfair_lock_unlock(&gManagedLock);
     if (todo.count && nvmtl_vk_pre_open()) {
+        NSMutableArray *staged = [NSMutableArray new];
         for (NSArray *t in todo) {
             NVMTLBuffer *b = t[0]; NSUInteger lo = [t[1] unsignedIntegerValue], n = [t[2] unsignedIntegerValue] - lo;
-            if (nvmtl_vk_pre_copy(&b->_shadow, lo, &b->_b, lo, n))
+            nvk_buffer *src = &b->_shadow; size_t srcOff = lo;
+            if (b->_shadowHeap) {
+                NVMTLStaging *st = nvmtl_staging(n);
+                if (!st) { nvlog("managed: no staging for an upload of %lu bytes - the GPU keeps the old bytes", (unsigned long)n); continue; }
+                memcpy(st->b.map, (const uint8_t *)b->_shadow.map + lo, n); [staged addObject:st]; src = &st->b; srcOff = 0;
+            }
+            if (nvmtl_vk_pre_copy(src, srcOff, &b->_b, lo, n))
                 nvlog("managed: upload of %lu bytes at %lu FAILED - the GPU keeps the old bytes", (unsigned long)n, (unsigned long)lo);
         }
+        [todo addObjectsFromArray:staged];
         nvmtl_pre_release_hook = nvmtl_pre_release;
         nvmtl_vk_pre_hold((__bridge_retained void *)todo);
     } else
     for (NSArray *t in todo) {
         NVMTLBuffer *b = t[0]; NSUInteger lo = [t[1] unsignedIntegerValue], n = [t[2] unsignedIntegerValue] - lo;
-        if (nvmtl_vk_copy_buffer(nvmtl_device_queue(), &b->_shadow, lo, &b->_b, lo, n))
+        NVMTLStaging *st = nil; nvk_buffer *src = &b->_shadow; size_t srcOff = lo;
+        if (b->_shadowHeap) {
+            st = nvmtl_staging(n);
+            if (!st) { nvlog("managed: no staging for an upload of %lu bytes - the GPU keeps the old bytes", (unsigned long)n); continue; }
+            memcpy(st->b.map, (const uint8_t *)b->_shadow.map + lo, n); src = &st->b; srcOff = 0;
+        }
+        if (nvmtl_vk_copy_buffer(nvmtl_device_queue(), src, srcOff, &b->_b, lo, n))
             nvlog("managed: upload of %lu bytes at %lu FAILED - the GPU keeps the old bytes", (unsigned long)n, (unsigned long)lo);
     }
     gManagedInFlush = 0;
@@ -713,7 +751,7 @@ static void nvmtl_zero_new_buffer(NVMTLBuffer *b, NSUInteger len) {
     const int m = nvmtl_zero_mode();
     if (!m || !b || !len) return;
     const int mz = b->_shadow.map && m >= 2 && b->_b.buf && !b->_b.map && nvmtl_mzero_on();
-    if (mz) __atomic_store_n(&b->_zshadow, 1, __ATOMIC_RELEASE);
+    if (mz && !b->_shadowHeap) __atomic_store_n(&b->_zshadow, 1, __ATOMIC_RELEASE);   // calloc already zeroed a heap shadow
     if (b->_shadow.map && !mz) {
         memset(b->_shadow.map, 0, len); nvmtl_managed_mark(b, 0, MIN((NSUInteger)b->_b.size, len));
     } else if (b->_b.map && !mz) {
@@ -974,6 +1012,8 @@ void nvmtl_vk_buffer_retire(nvk_buffer *b);
     for (uint32_t k = 0; k < _nbpk; k++) nvmtl_vk_image_destroy(&_bpk[k].img);
     free(_bpk); _bpk = NULL; _nbpk = 0;
     nvmtl_vk_buffer_retire(&_b); if (_shadow.buf) nvmtl_vk_buffer_retire(&_shadow);
+    // freeing 0.5-4 MB hands pages back to the kernel (up to 3.9 ms on the releasing thread): done on a utility thread
+    if (_shadowHeap) { dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), _shadow.map, free); _shadow.map = NULL; _shadowHeap = 0; }
     if (_subHeap) { NVMTLHeap *h = _subHeap; NSUInteger c = _subCharge; _subHeap = nil; _subCharge = 0;
                     if (_subPlaced && c) { _subPlaced = NO; [h nvmtlGiveRange:_heapOffset length:c]; }
                     [h nvmtlReleaseSubAllocation:c]; }
@@ -5016,7 +5056,9 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
     if ([(id)r isKindOfClass:[NVMTLBuffer class]] && ((NVMTLBuffer *)r)->_shadow.map) {
         NVMTLBuffer *b = (NVMTLBuffer *)r;
         __atomic_store_n(&b->_zshadow, 0, __ATOMIC_RELEASE);
-        if (nvmtl_vk_cmd_copy_buffer(&_cb->_c, &b->_b, 0, &b->_shadow, 0, b->_b.size))
+        // a heap shadow is filled when the part that holds this command lands, before the command buffer completes
+        if (b->_shadowHeap) __atomic_store_n(&b->_syncOut, 1, __ATOMIC_RELEASE);
+        else if (nvmtl_vk_cmd_copy_buffer(&_cb->_c, &b->_b, 0, &b->_shadow, 0, b->_b.size))
             [_cb nvmtlRecordEncodingError:[NSError errorWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInternal
                 userInfo:@{NSLocalizedDescriptionKey:@"Cannot encode managed buffer synchronization"}]];
     }
@@ -5026,7 +5068,8 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
         if (bb && bb->_shadow.map) {
             [_cb->_resources addObject:bb];
             __atomic_store_n(&bb->_zshadow, 0, __ATOMIC_RELEASE);
-            if (nvmtl_vk_cmd_copy_buffer(&_cb->_c, &bb->_b, 0, &bb->_shadow, 0, bb->_b.size))
+            if (bb->_shadowHeap) __atomic_store_n(&bb->_syncOut, 1, __ATOMIC_RELEASE);
+            else if (nvmtl_vk_cmd_copy_buffer(&_cb->_c, &bb->_b, 0, &bb->_shadow, 0, bb->_b.size))
                 [_cb nvmtlRecordEncodingError:[NSError errorWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInternal
                     userInfo:@{NSLocalizedDescriptionKey:@"Cannot encode managed buffer-texture synchronization"}]];
         }
@@ -5862,8 +5905,17 @@ static void nvmtl_buffer_sync_in(NVMTLBuffer *b)
 static void nvmtl_buffer_sync_out(NVMTLBuffer *b)
 {
     if (b && b->_shadow.map) {
-        if (b->_syncOut) { b->_syncOut = 0; __atomic_store_n(&b->_zshadow, 0, __ATOMIC_RELEASE);
-            if (nvmtl_vk_copy_buffer(nvmtl_device_queue(), &b->_b, 0, &b->_shadow, 0, b->_b.size)) nvlog("commit: managed sync-out of %zu bytes FAILED", b->_b.size); }
+        int owed = 1;
+        if (__atomic_compare_exchange_n(&b->_syncOut, &owed, 0, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&b->_zshadow, 0, __ATOMIC_RELEASE);
+            if (b->_shadowHeap) {
+                NVMTLStaging *st = nvmtl_staging(b->_b.size);
+                if (!st || nvmtl_vk_copy_buffer(nvmtl_device_queue(), &b->_b, 0, &st->b, 0, b->_b.size))
+                    nvlog("commit: managed sync-out of %zu bytes FAILED", b->_b.size);
+                else memcpy(b->_shadow.map, st->b.map, b->_b.size);
+            } else if (nvmtl_vk_copy_buffer(nvmtl_device_queue(), &b->_b, 0, &b->_shadow, 0, b->_b.size))
+                nvlog("commit: managed sync-out of %zu bytes FAILED", b->_b.size);
+        }
         return;
     }
     if (!b || !b->_hostPtr || !b->_b.map || !b->_hostLen) return;
