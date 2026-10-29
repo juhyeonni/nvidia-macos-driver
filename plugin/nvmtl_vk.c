@@ -4618,7 +4618,8 @@ void nvmtl_vk_sampler_destroy(nvk_sampler *s)
 }
 
 static int nvmtl_vk_compute_pipeline_create_g(const void *cs, size_t n, uint32_t flags, nvk_pipeline *out);
-int nvmtl_vk_compute_pipeline_create(const void *cs, size_t n, nvk_pipeline *out) { return nvmtl_vk_compute_pipeline_create_g(cs, n, 0, out); }
+// flag 8: buffers the translator keeps as descriptors join the align guard (16-byte offsets), see lower_for_guard
+int nvmtl_vk_compute_pipeline_create(const void *cs, size_t n, nvk_pipeline *out) { return nvmtl_vk_compute_pipeline_create_g(cs, n, 8, out); }
 static int nvmtl_vk_compute_pipeline_create_g_lifetime_body(const void *cs, size_t n, uint32_t flags, nvk_pipeline *out);
 static int nvmtl_vk_compute_pipeline_create_g(const void *cs, size_t n, uint32_t flags, nvk_pipeline *out)
 {
@@ -4635,7 +4636,7 @@ static int nvmtl_vk_compute_pipeline_create_g_lifetime_body(const void *cs, size
     if (!(flags & 1) && ag[2]) {
         const unsigned long long k = atomic_fetch_add(&g_ag_untraceable, 1) + 1;
         if (!(k & (k - 1))) nvlog("align guard: %llu compute module(s) built SAFE - a promised access could not be traced to a binding", k);
-        data = nvmtl_address_shader_g(cs, n, 1, NULL); if (!data) return -1;
+        data = nvmtl_address_shader_g(cs, n, flags | 1, NULL); if (!data) return -1;
         ag[0] = 0;
     }
     cs = data.bytes; n = data.length;
@@ -4713,7 +4714,7 @@ static nvk_pipeline *nvmtl_align_guard_pick(nvk_cmdbuf *c, nvk_pipeline *p)
     nvk_pipeline *sp = (nvk_pipeline *)p->ag_safe;
     if (!sp && p->ag_src) {
         sp = calloc(1, sizeof *sp);
-        if (sp && nvmtl_vk_compute_pipeline_create_g(p->ag_src, p->ag_srcn, 1, sp)) { free(sp); sp = NULL; }
+        if (sp && nvmtl_vk_compute_pipeline_create_g(p->ag_src, p->ag_srcn, 1 | 8, sp)) { free(sp); sp = NULL; }
         p->ag_safe = sp;
         nvlog("align guard: buffer %d bound at GPU address %#llx is not %u-aligned - %s", bad, (unsigned long long)at, p->ag_req,
               sp ? "this kernel now runs its SAFE module on such bindings (Apple runs a broken alignment promise exactly)" : "SAFE module FAILED - such dispatches are SKIPPED");

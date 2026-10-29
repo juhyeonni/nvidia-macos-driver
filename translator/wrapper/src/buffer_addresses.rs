@@ -98,10 +98,13 @@ fn keep_stated_align(scalar: u32, stated: Option<&Operand>) -> u32 {
     match stated { Some(Operand::LiteralBit32(a)) if a.is_power_of_two() && *a <= 16 => scalar.max(*a), _ => scalar }
 }
 
-pub fn lower(bytes: &[u8]) -> Result<Vec<u8>, String> {
+pub fn lower(bytes: &[u8]) -> Result<Vec<u8>, String> { lower_keeping(bytes, true).map(|(v, _)| v) }
+/// `keep`: buffers read at data-dependent indices stay descriptors. Also returns those buffers' bindings as a mask: a
+/// descriptor needs a 16-byte-aligned offset, so a caller that sees one bound elsewhere lowers again with `keep` false.
+pub fn lower_keeping(bytes: &[u8], keep: bool) -> Result<(Vec<u8>, u32), String> {
     match crate::linearize::apply(bytes) {
-        Ok((lin, _why)) => lower_addresses(&lin),
-        Err(_) => lower_addresses(bytes),
+        Ok((lin, _why)) => lower_addresses(&lin, keep),
+        Err(_) => lower_addresses(bytes, keep),
     }
 }
 /// A table the translator declared at TABLE_BINDING that buffer addresses can be read from: a StorageBuffer variable
@@ -132,7 +135,7 @@ fn existing_table(defs: &HashMap<u32, Instruction>, m: &rspirv::dr::Module, tv: 
     }
 }
 
-fn lower_addresses(bytes: &[u8]) -> Result<Vec<u8>, String> {
+fn lower_addresses(bytes: &[u8], keep: bool) -> Result<(Vec<u8>, u32), String> {
     let mut m = rspirv::dr::load_bytes(bytes).map_err(|e| e.to_string())?;
     let defs: HashMap<_,_> = m.types_global_values.iter().filter_map(|i| i.result_id.map(|n|(n,i.clone()))).collect();
     let sb_types: HashMap<u32,u32> = defs.iter().filter_map(|(&n,i)| {
@@ -156,7 +159,7 @@ fn lower_addresses(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let table_var = bindings.iter().find(|(_, b)| **b == TABLE_BINDING).map(|(n, _)| *n);
     let existing = match table_var {
         None => None,
-        Some(tv) => match existing_table(&defs, &m, tv, &sets) { Some(t) => Some(t), None => return Ok(bytes.to_vec()) },
+        Some(tv) => match existing_table(&defs, &m, tv, &sets) { Some(t) => Some(t), None => return Ok((bytes.to_vec(), 0)) },
     };
     let roots: Vec<(u32,u32,u32)> = roots.into_iter().filter(|r| Some(r.0) != table_var).collect();
     // A buffer whose block holds a runtime array is read wherever its data points (a light list, a froxel grid) and
@@ -165,9 +168,10 @@ fn lower_addresses(bytes: &[u8]) -> Result<Vec<u8>, String> {
     // bounds-checks with robustBufferAccess; fixed-size blocks still move to addresses.
     let mut value_types = HashMap::new();
     for i in m.all_inst_iter() { if let (Some(n),Some(t)) = (i.result_id,i.result_type) { value_types.insert(n,t); } }
-    let (kept, kept_derived) = kept_roots(&m, &defs, &sb_types, &roots, &value_types);
+    let (kept, kept_derived) = if keep { kept_roots(&m, &defs, &sb_types, &roots, &value_types) } else { Default::default() };
+    let kept_mask = roots.iter().filter(|r| kept.contains(&r.0) && r.2 < 32).fold(0u32, |a, r| a | 1 << r.2);
     let roots: Vec<(u32,u32,u32)> = roots.into_iter().filter(|r| !kept.contains(&r.0)).collect();
-    if roots.is_empty() { return Ok(bytes.to_vec()); }
+    if roots.is_empty() { return Ok((bytes.to_vec(), kept_mask)); }
     for &(n,_,b) in &roots {
         if b >= 32 || sets.get(&n) != Some(&0) { return Err(format!("unsupported source buffer descriptor {n}, binding {b}")); }
     }
@@ -278,7 +282,7 @@ fn lower_addresses(bytes: &[u8]) -> Result<Vec<u8>, String> {
     if std::env::var_os("NVMTL_NO_WIDE_WORD_LOAD").is_none() { crate::wide_loads::fuse(&mut m, &mut next, uint, ulong, &wide_hints); }
     m.header.as_mut().unwrap().bound=next;
     let result:Vec<u8>=m.assemble().iter().flat_map(|w|w.to_le_bytes()).collect();
-    metal2vulkan::canonicalize_spirv_bytes(&result)
+    metal2vulkan::canonicalize_spirv_bytes(&result).map(|v| (v, kept_mask))
 }
 
 #[cfg(test)]
@@ -326,6 +330,15 @@ OpFunctionEnd
         let m=rspirv::dr::load_bytes(&output).unwrap();
         assert!(m.all_inst_iter().any(|i|i.class.opcode==Op::ConvertUToPtr));
         assert!(m.annotations.iter().any(|i|i.operands.ends_with(&[Operand::Decoration(Decoration::Binding),Operand::LiteralBit32(640)])));
+    }
+    #[test] fn a_buffer_read_at_a_loaded_index_is_kept_and_reported_unless_keeping_is_off() {
+        let input=source(&FIXTURE.replace("%p = OpAccessChain %pu %buf %zero %one","%q = OpAccessChain %pu %buf %zero %zero\n%i = OpLoad %uint %q\n%p = OpAccessChain %pu %buf %zero %i"));
+        validate(&input);
+        let lowered=|v:&[u8]| rspirv::dr::load_bytes(v).unwrap().all_inst_iter().any(|i|i.class.opcode==Op::ConvertUToPtr);
+        let (kept,mask)=lower_keeping(&input,true).unwrap();
+        assert_eq!((mask,lowered(&kept)),(1,false));
+        let (all,mask)=lower_keeping(&input,false).unwrap(); validate(&all);
+        assert_eq!((mask,lowered(&all)),(0,true));
     }
     #[test] fn keeps_memory_access_flags() {
         let input=source(&FIXTURE.replace("%x = OpLoad %uint %p","%x = OpLoad %uint %p Volatile|Aligned 16").replace("OpStore %p %y","OpStore %p %y Volatile"));

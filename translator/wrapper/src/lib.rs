@@ -701,15 +701,30 @@ pub unsafe extern "C" fn nvmtl_table_to_uniform(
         Err(e) => { if !err.is_null() && err_len>0 { let n=e.len().min(err_len-1); std::ptr::copy_nonoverlapping(e.as_ptr(),err.cast(),n); *err.add(n)=0; } -1 }
     }
 }
+// Flag 8 (compute): a buffer kept as a descriptor reads nothing at an offset that is not 16-aligned, which Metal allows
+// (ANGLE's index rewrite binds its index buffer at the draw's offset). Such buffers join the guard's mask with a 16-byte
+// requirement, and the safe module (flags 1|8) lowers them to addresses too.
+fn lower_for_guard(spv: &[u8], flags: u32, kept: &mut u32) -> Result<Vec<u8>, String> {
+    let compute = flags & 8 != 0;
+    let (v, k) = buffer_addresses::lower_keeping(spv, !(compute && flags & 1 != 0))?;
+    if compute && flags & 1 == 0 { *kept = k; }
+    Ok(v)
+}
+fn guard_kept(mut rep: align_guard::Report, kept: u32) -> align_guard::Report {
+    if kept != 0 { rep.mask |= kept; rep.req = rep.req.max(16); }
+    rep
+}
 #[no_mangle]
 pub unsafe extern "C" fn nvmtl_lower_buffer_addresses_ex(
     data: *const u8, len: usize, flags: u32, out: *mut *mut u8, out_len: *mut usize, info: *mut u32,
     err: *mut c_char, err_len: usize,
 ) -> i32 {
     if data.is_null() || out.is_null() || out_len.is_null() { return -1; }
-    let r = buffer_addresses::lower(std::slice::from_raw_parts(data,len))
+    let mut kept = 0;
+    let r = lower_for_guard(std::slice::from_raw_parts(data,len), flags, &mut kept)
         .and_then(|v| if flags & 2 != 0 { table_ubo::convert(&v) } else { Ok(v) })
-        .and_then(|v| align_guard::guard(&v, flags & 1 != 0));
+        .and_then(|v| align_guard::guard(&v, flags & 1 != 0))
+        .map(|(v, rep)| (v, guard_kept(rep, kept)));
     match r {
         Ok((v, rep)) => {
             if !info.is_null() { *info = rep.mask; *info.add(1) = rep.req; *info.add(2) = rep.untraceable as u32; *info.add(3) = rep.accesses; }
@@ -725,10 +740,12 @@ pub unsafe extern "C" fn nvmtl_lower_buffer_addresses_g2(
 ) -> i32 {
     if data.is_null() || out.is_null() || out_len.is_null() { return -1; }
     let mut eligible = 0u32;
-    let r = buffer_addresses::lower(std::slice::from_raw_parts(data,len))
+    let mut kept = 0;
+    let r = lower_for_guard(std::slice::from_raw_parts(data,len), flags, &mut kept)
         .and_then(|v| if flags & 2 != 0 { table_ubo::convert(&v) } else { Ok(v) })
         .and_then(|v| g2_inline::apply(&v, if flags & 4 != 0 { mask } else { 0 }).map(|(v, e)| { eligible = e; v }))
-        .and_then(|v| align_guard::guard(&v, flags & 1 != 0));
+        .and_then(|v| align_guard::guard(&v, flags & 1 != 0))
+        .map(|(v, rep)| (v, guard_kept(rep, kept)));
     match r {
         Ok((v, rep)) => {
             if !info.is_null() { *info = rep.mask; *info.add(1) = rep.req; *info.add(2) = rep.untraceable as u32; *info.add(3) = rep.accesses; *info.add(4) = eligible; }
