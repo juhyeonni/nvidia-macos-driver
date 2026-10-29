@@ -1130,9 +1130,12 @@ static int memtype(uint32_t bits, VkMemoryPropertyFlags want)
     return -1;
 }
 
-#define NVMTL_POOL_BLOCK (32u << 20)
+#define NVMTL_POOL_BLOCK (8u << 20)
 #define NVMTL_POOL_MAX   (4u << 20)
-#define NVMTL_POOL_KEEP  2
+// Empty blocks kept for reuse, by bytes: freeing and re-allocating pinned pages holds RM's lock, which stalls every other
+// process's display flips. The VRAM (BAR1) pool keeps less, since a small BAR1 window is shared by the whole system.
+#define NVMTL_POOL_KEEP_BYTES  (256ull << 20)
+#define NVMTL_VPOOL_KEEP_BYTES (32ull << 20)
 static size_t g_bar1_bytes; static int g_bar1_off;
 static int bar1_on(void)
 {
@@ -8110,8 +8113,8 @@ static void pool_buffer_release(nvk_buffer *b)
     pool_block_give(blk, b->poff, b->alloc);
     if (!blk->nlive) {
         pool_block **head = blk->vram ? &g_vpool : &g_pool;
-        uint32_t empties = 0; for (pool_block *p = *head; p; p = p->next) if (!p->nlive) empties++;
-        if (empties > NVMTL_POOL_KEEP) {
+        uint64_t empty = 0; for (pool_block *p = *head; p; p = p->next) if (!p->nlive) empty += p->heap.size;
+        if (empty > (blk->vram ? NVMTL_VPOOL_KEEP_BYTES : NVMTL_POOL_KEEP_BYTES)) {
             pool_block **pp = head; while (*pp && *pp != blk) pp = &(*pp)->next;
             if (*pp) { *pp = blk->next; const size_t hs = blk->heap.size; const int v = blk->vram;
                 nvmtl_vk_heap_destroy(&blk->heap); free(blk->fr); free(blk); g_pool_blocks--;
