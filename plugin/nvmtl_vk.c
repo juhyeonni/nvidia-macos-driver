@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#include <dispatch/dispatch.h>
 #include <math.h>
 #define VK_NO_PROTOTYPES 1
 #include <vulkan/vulkan.h>
@@ -157,12 +158,12 @@ static long nvmtl_gpu_wait_budget_ms(void)
     cached = (me && strcmp(me, "WindowServer") == 0) ? 5000 : 60000;
     return cached;
 }
-static size_t g_alloc_bytes;
+static _Atomic size_t g_alloc_bytes;   // also changed by the pool make-ahead thread
 static uint64_t g_buf_made, g_buf_gone, g_img_made, g_img_gone;
 static uint64_t g_pool_blocks, g_pool_live, g_pool_bytes;
 static uint64_t g_img_align, g_sys_align;
 void (*nvmtl_purge_report_hook)(const char *why);
-static uint64_t g_budget_delta;
+static _Atomic uint64_t g_budget_delta;   // also charged by the pool make-ahead thread
 static int g_budget_stale;
 static void nvmtl_vk_budget_charge(uint64_t bytes)
 {
@@ -478,6 +479,7 @@ typedef struct { uint32_t version, surfaceID, plane, pad; uint64_t size_B; } nvm
 static void (*pnvk_stage_import)(const nvmtl_vram_rec *);
 static uint32_t (*pnvk_surface_dirty)(VkDevice, uint32_t, uint32_t);
 static int (*pnvk_sparse)(void);
+static int (*pnvk_dedicated_tiled)(void);
 static int g_qsparse, g_sparse;
 static int g_extfd;
 
@@ -734,6 +736,7 @@ static int nvmtl_vk_initialize(void)
             pnvk_sample_depth_contract = (VkResult (*)(VkDevice, uint32_t *, uint32_t *))dlsym(g_lib, "nvmtl_nvk_sample_depth_contract_v1");
             pnvk_sample_depth_image = (VkResult (*)(VkDevice, VkImage, uint32_t *))dlsym(g_lib, "nvmtl_nvk_sample_depth_image_v1");
             pnvk_sparse = (int (*)(void))dlsym(g_lib, "nvmtl_nvk_sparse_bind_v1");
+            pnvk_dedicated_tiled = (int (*)(void))dlsym(g_lib, "nvmtl_nvk_dedicated_tiled_v1");
         }
         else { nvlog("vk: %s has no vkGetInstanceProcAddr", NVMTL_ICD_LIB); dlclose(g_lib); g_lib = NULL; }
     } else {
@@ -1132,6 +1135,7 @@ static int memtype(uint32_t bits, VkMemoryPropertyFlags want)
 
 #define NVMTL_POOL_BLOCK (8u << 20)
 #define NVMTL_POOL_MAX   (4u << 20)
+#define NVMTL_DPOOL_MAX  (1u << 20)
 // Empty blocks kept for reuse, by bytes: freeing and re-allocating pinned pages holds RM's lock, which stalls every other
 // process's display flips. The VRAM (BAR1) pool keeps less, since a small BAR1 window is shared by the whole system.
 #define NVMTL_POOL_KEEP_BYTES  (256ull << 20)
@@ -1166,6 +1170,7 @@ static int bar1_memtype(uint32_t bits, VkDeviceSize size)
 static int  pool_buffer_create(size_t size, nvk_buffer *out);
 static int  pool_buffer_create_in(int vram, size_t size, nvk_buffer *out);
 static int  vpool_on(void);
+static int  dpool_on(void);
 static void pool_buffer_release(nvk_buffer *b);
 #define NVMTL_BUFPARK_N     32
 #define NVMTL_BUFPARK_BYTES (256ull << 20)
@@ -1336,6 +1341,8 @@ static int nvmtl_vk_buffer_create_body(size_t size, int host_visible, nvk_buffer
     if (host_visible && size <= NVMTL_POOL_MAX && pool_buffer_create(size, out) == 0) return 0;
     memset(out, 0, sizeof *out); out->size = size;
     if (bpark_take(size, host_visible, out) == 0) return 0;
+    memset(out, 0, sizeof *out); out->size = size;
+    if (!host_visible && size <= NVMTL_DPOOL_MAX && dpool_on() && pool_buffer_create_in(2, size, out) == 0) return 0;
     memset(out, 0, sizeof *out); out->size = size;
     if (!host_visible && size >= (1u << 20) && nvmtl_vk_sparse_on() && nvmtl_vk_buffer_create_sparse(size, out) == 0) return 0;
     memset(out, 0, sizeof *out); out->size = size;
@@ -1822,12 +1829,22 @@ static void nvmtl_vk_image_census(void)
               (unsigned long long)(nvmtl_vk_vram_bytes() >> 20), (unsigned long long)(bud >> 20), (unsigned long long)(used >> 20), m ? "measured" : "estimated",
               nvmtl_tex_objs_live(), nvmtl_tex_objs_released()); }
 }
-static VkResult nvmtl_vk_alloc_image_mem(const VkMemoryRequirements *mr, VkDeviceMemory *mem, uint32_t *sysmem, const char *what)
+// An image's memory is named its dedicated allocation when NVK can make it with the image's PTE kind (nvk_AllocateMemory),
+// so binding reuses that VA instead of mapping the memory a second time: half of a new 190 MB multisample attachment's
+// creation. NVMTL_IMAGE_DEDICATED=0 turns it off.
+static int nvmtl_image_dedicated_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_IMAGE_DEDICATED"); on = pnvk_dedicated_tiled && pnvk_dedicated_tiled() && !(e && e[0] == '0'); }
+    return on;
+}
+static VkResult nvmtl_vk_alloc_image_mem(const VkMemoryRequirements *mr, VkImage img, VkDeviceMemory *mem, uint32_t *sysmem, const char *what)
 {
     *sysmem = 0;
     int mt = memtype(mr->memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (mt < 0) { nvlog("vk: no device-local memory type for the %s image", what); return VK_ERROR_OUT_OF_DEVICE_MEMORY; }
-    VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, mr->size, (uint32_t)mt };
+    VkMemoryDedicatedAllocateInfo dai = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, NULL, img, VK_NULL_HANDLE };
+    VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, img && nvmtl_image_dedicated_on() ? &dai : NULL, mr->size, (uint32_t)mt };
     uint64_t bud = 0, used = 0, freev = 0; int measured = 0;
     int gate = nvmtl_vk_vram_wall(mr->size, &freev, &bud, &used, &measured);
     VkResult r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -1868,10 +1885,10 @@ static VkResult nvmtl_vk_alloc_image_mem(const VkMemoryRequirements *mr, VkDevic
     }
     return r;
 }
-static VkResult nvmtl_alloc_opaque_image_mem(const VkMemoryRequirements *mr, void **out, uint32_t *sysmem, const char *what)
+static VkResult nvmtl_alloc_opaque_image_mem(const VkMemoryRequirements *mr, void *img, void **out, uint32_t *sysmem, const char *what)
 {
     VkDeviceMemory memory = VK_NULL_HANDLE;
-    VkResult result = nvmtl_vk_alloc_image_mem(mr, &memory, sysmem, what);
+    VkResult result = nvmtl_vk_alloc_image_mem(mr, (VkImage)img, &memory, sysmem, what);
     if (result == VK_SUCCESS) {
         *out = memory;
         if (!*sysmem) nvmtl_vk_budget_charge(mr->size);
@@ -1926,7 +1943,7 @@ static int nvmtl_vk_image_create_ms_lifetime_body(uint32_t w, uint32_t h, uint32
     nvmtl_vk_image_mutable(&ici, out);
     VKCK(nvmtl_opaque_CreateImage(g_dev, &ici, NULL, &out->img), "vkCreateImage(ms)");
     VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, out->img, &mr);
-    VKCK(nvmtl_alloc_opaque_image_mem(&mr, &out->mem, &out->sysmem, "multisample"), "vkAllocateMemory(ms)");
+    VKCK(nvmtl_alloc_opaque_image_mem(&mr, out->img, &out->mem, &out->sysmem, "multisample"), "vkAllocateMemory(ms)");
     out->alloc = mr.size;
     VKCK(pvkBindImageMemory(g_dev, out->img, out->mem, 0), "vkBindImageMemory(ms)");
     VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, out->img, mtl_type == 8 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, (VkFormat)vkfmt,
@@ -1964,7 +1981,7 @@ static int nvmtl_vk_image_create_typed_lifetime_body(uint32_t w, uint32_t h, uin
     nvmtl_vk_image_mutable(&ici, out);
     VKCK(nvmtl_opaque_CreateImage(g_dev, &ici, NULL, &out->img), "vkCreateImage");
     VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, out->img, &mr);
-    VKCK(nvmtl_alloc_opaque_image_mem(&mr, &out->mem, &out->sysmem, "colour"), "vkAllocateMemory(image)");
+    VKCK(nvmtl_alloc_opaque_image_mem(&mr, out->img, &out->mem, &out->sysmem, "colour"), "vkAllocateMemory(image)");
     out->alloc = mr.size;
     VKCK(pvkBindImageMemory(g_dev, out->img, out->mem, 0), "vkBindImageMemory");
     VkComponentMapping swz = a8 ? (VkComponentMapping){ VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R }
@@ -3621,7 +3638,7 @@ static int nvmtl_vk_depth_create_full_lifetime_body(uint32_t w, uint32_t h, uint
     VKCK(nvmtl_opaque_CreateImage(g_dev, &ici, NULL, &out->img), "vkCreateImage(depth)");
     out->usage = (uint32_t)ici.usage;
     VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, out->img, &mr);
-    VKCK(nvmtl_alloc_opaque_image_mem(&mr, &out->mem, &out->sysmem, "depth"), "vkAllocateMemory(depth)");
+    VKCK(nvmtl_alloc_opaque_image_mem(&mr, out->img, &out->mem, &out->sysmem, "depth"), "vkAllocateMemory(depth)");
     out->alloc = mr.size;
     VKCK(pvkBindImageMemory(g_dev, out->img, out->mem, 0), "vkBindImageMemory(depth)");
     VkImageViewType vt = out->mtl_type == 3 || out->mtl_type == 8 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : out->mtl_type == 5 ? VK_IMAGE_VIEW_TYPE_CUBE
@@ -7985,13 +8002,22 @@ static int nvmtl_vk_image_create_buffer_alias_lifetime_body(uint32_t w, uint32_t
 typedef struct { size_t off, len; } pool_range;
 typedef struct pool_block {
     struct pool_block *next; nvk_heap heap; size_t used; uint32_t nlive;
-    int vram;
+    int vram;   // 0 system RAM, 1 VRAM mapped through BAR1, 2 VRAM the CPU never maps
     pool_range *fr; uint32_t nfr, cfr;
 } pool_block;
 static pool_block *g_pool;
 #define NVMTL_VPOOL_BLOCK (8u << 20)
 static pool_block *g_vpool;
 static uint64_t g_vpool_blocks;
+// Private buffers and the VRAM half of Managed ones, 1 MB or less, are ranges of 16 MB device-local blocks. ANGLE uploads
+// Google Maps tiles as hundreds of 0.5-1 MB Managed buffers it keeps alive; one VRAM allocation each cost 0.13-0.3 ms to
+// create and 0.2 ms to free on Chrome's GPU thread, half of each 0.5 s stall. Larger ones keep their own allocation: a
+// burst of same-size 4 MB buffers dropped and made again is served by the buffer park, and in the pool it emptied and
+// re-made dozens of blocks per burst (other processes missed 12 frames per 9 s).
+#define NVMTL_DPOOL_BLOCK (16u << 20)
+#define NVMTL_DPOOL_KEEP_BYTES (64ull << 20)
+static pool_block *g_dpool;
+static pool_block **pool_head(int kind) { return kind == 2 ? &g_dpool : kind ? &g_vpool : &g_pool; }
 static pthread_mutex_t g_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static size_t g_pool_align;
 
@@ -8033,6 +8059,13 @@ static void pool_block_give(pool_block *blk, size_t off, size_t len)
     }
     if (!blk->nlive) { blk->used = 0; blk->nfr = 0; }
 }
+static int dpool_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_PRIVATE_POOL"); on = !(e && e[0] == '0');
+        if (!on) nvlog("vk: small Private buffers take one VRAM allocation each (NVMTL_PRIVATE_POOL=0)"); }
+    return on;
+}
 static int vpool_on(void)
 {
     static int on = -1;
@@ -8042,6 +8075,7 @@ static int vpool_on(void)
 }
 static const char *pool_place_why(int vram)
 {
+    if (vram == 2) return "VRAM, device-local for small Private and Managed buffers";
     if (vram) return "VRAM through BAR1";
     if (!bar1_on()) return "system RAM BY DESIGN - Shared is system RAM on a discrete GPU (batch 56; NVMTL_SHARED_VRAM=1 opts in)";
     if (g_bar1_off) return "system RAM - BAR1 REFUSED a VRAM block for this process (see the REFUSED line above)";
@@ -8074,23 +8108,51 @@ static int vpool_heap_create(size_t size, nvk_heap *out)
     g_alloc_bytes += size; g_bar1_bytes += size;
     return 0;
 }
+// A new block costs the kernel 3-10 ms (8 MB of system RAM wired and zeroed, 16 MB of VRAM), every 8-20 creates in a
+// burst. When the newest block is half used and no empty one is waiting, the next one is made on a utility thread, so
+// the thread creating buffers (Chrome's GPU main thread) finds it ready. BAR1 blocks are not made ahead.
+static _Atomic int g_pool_ahead[3];
+static _Atomic uint64_t g_pool_made[3];   // blocks made per kind (0 system RAM, 1 BAR1, 2 VRAM), each one a kernel allocation
+void nvmtl_vk_pool_blocks_made(uint64_t out[3]) { for (int i = 0; i < 3; i++) out[i] = atomic_load(&g_pool_made[i]); }
+static void pool_ahead_fn(void *ctx)
+{
+    const int kind = (int)(intptr_t)ctx;
+    pool_block *nb = calloc(1, sizeof *nb);
+    if (nb && !(kind == 2 ? nvmtl_vk_heap_create(NVMTL_DPOOL_BLOCK, 0, &nb->heap) : nvmtl_vk_heap_create(NVMTL_POOL_BLOCK, 1, &nb->heap))) {
+        pthread_mutex_lock(&g_pool_lock);
+        pool_block **head = pool_head(kind); nb->vram = kind; nb->next = *head; *head = nb; g_pool_blocks++; atomic_fetch_add(&g_pool_made[kind], 1);
+        pthread_mutex_unlock(&g_pool_lock);
+    } else free(nb);
+    atomic_store(&g_pool_ahead[kind], 0);
+}
+static int pool_ahead_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("NVMTL_POOL_AHEAD"); on = !(e && e[0] == '0'); } return on; }
+static void pool_ahead_locked(int kind, const pool_block *blk)
+{
+    if (kind == 1 || !pool_ahead_on() || blk != *pool_head(kind) || blk->used < blk->heap.size / 2) return;
+    for (const pool_block *p = *pool_head(kind); p; p = p->next) if (!p->nlive && p != blk) return;
+    int idle = 0;
+    if (atomic_compare_exchange_strong(&g_pool_ahead[kind], &idle, 1))
+        dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), (void *)(intptr_t)kind, pool_ahead_fn);
+}
 static int pool_buffer_create_in(int vram, size_t size, nvk_buffer *out)
 {
     size_t al = pool_align(), len = (size + al - 1) / al * al; if (!len) len = al;
     pthread_mutex_lock(&g_pool_lock);
-    pool_block **head = vram ? &g_vpool : &g_pool;
+    pool_block **head = pool_head(vram);
     pool_block *blk = *head; size_t off = 0; int got = 0;
     for (; blk; blk = blk->next) if (pool_block_take(blk, len, &off)) { got = 1; break; }
     if (!got) {
         pool_block *nb = calloc(1, sizeof *nb);
-        if (!nb || (vram ? vpool_heap_create(NVMTL_VPOOL_BLOCK, &nb->heap) : nvmtl_vk_heap_create(NVMTL_POOL_BLOCK, 1, &nb->heap))) { free(nb); pthread_mutex_unlock(&g_pool_lock); return -1; }
-        nb->vram = vram; nb->next = *head; *head = nb; g_pool_blocks++; if (vram) g_vpool_blocks++;
+        if (!nb || (vram == 2 ? nvmtl_vk_heap_create(NVMTL_DPOOL_BLOCK, 0, &nb->heap) : vram ? vpool_heap_create(NVMTL_VPOOL_BLOCK, &nb->heap)
+                                : nvmtl_vk_heap_create(NVMTL_POOL_BLOCK, 1, &nb->heap))) { free(nb); pthread_mutex_unlock(&g_pool_lock); return -1; }
+        nb->vram = vram; nb->next = *head; *head = nb; g_pool_blocks++; if (vram == 1) g_vpool_blocks++; atomic_fetch_add(&g_pool_made[vram], 1);
         nvlog("buffer pool: block #%llu mapped (%zu MiB, %s; %llu VRAM blocks, memory type %u); %llu pooled buffers live in %llu bytes of ranges",
               (unsigned long long)g_pool_blocks, nb->heap.size >> 20, pool_place_why(vram), (unsigned long long)g_vpool_blocks,
               nb->heap.memtype, (unsigned long long)g_pool_live, (unsigned long long)g_pool_bytes);
         blk = nb; if (!pool_block_take(blk, len, &off)) { pthread_mutex_unlock(&g_pool_lock); return -1; }
     }
     blk->nlive++; g_pool_live++; g_pool_bytes += len;
+    pool_ahead_locked(vram, blk);
     pthread_mutex_unlock(&g_pool_lock);
     nvk_buffer pb; memset(&pb, 0, sizeof pb);
     if (nvmtl_vk_buffer_create_placed(size, &blk->heap, off, &pb)) {
@@ -8105,6 +8167,7 @@ static int pool_buffer_create_in(int vram, size_t size, nvk_buffer *out)
     return 0;
 }
 static int pool_buffer_create(size_t size, nvk_buffer *out) { return pool_buffer_create_in(0, size, out); }
+static void pool_block_free_fn(void *p) { pool_block *blk = p; nvmtl_vk_heap_destroy(&blk->heap); free(blk); }
 static void pool_buffer_release(nvk_buffer *b)
 {
     pool_block *blk = (pool_block *)b->pool; if (!blk) return;
@@ -8112,13 +8175,15 @@ static void pool_buffer_release(nvk_buffer *b)
     blk->nlive--; g_pool_live--; g_pool_bytes -= b->alloc;
     pool_block_give(blk, b->poff, b->alloc);
     if (!blk->nlive) {
-        pool_block **head = blk->vram ? &g_vpool : &g_pool;
+        pool_block **head = pool_head(blk->vram);
         uint64_t empty = 0; for (pool_block *p = *head; p; p = p->next) if (!p->nlive) empty += p->heap.size;
-        if (empty > (blk->vram ? NVMTL_VPOOL_KEEP_BYTES : NVMTL_POOL_KEEP_BYTES)) {
+        if (empty > (blk->vram == 2 ? NVMTL_DPOOL_KEEP_BYTES : blk->vram ? NVMTL_VPOOL_KEEP_BYTES : NVMTL_POOL_KEEP_BYTES)) {
             pool_block **pp = head; while (*pp && *pp != blk) pp = &(*pp)->next;
             if (*pp) { *pp = blk->next; const size_t hs = blk->heap.size; const int v = blk->vram;
-                nvmtl_vk_heap_destroy(&blk->heap); free(blk->fr); free(blk); g_pool_blocks--;
-                if (v) { g_vpool_blocks--; g_bar1_bytes -= hs; } }
+                free(blk->fr); g_pool_blocks--;
+                if (v == 1) { g_vpool_blocks--; g_bar1_bytes -= hs; }
+                // giving a block back is a kernel free (3 ms for 16 MB of VRAM) on the thread that dropped the last buffer
+                dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), blk, pool_block_free_fn); }
         }
     }
     pthread_mutex_unlock(&g_pool_lock);
