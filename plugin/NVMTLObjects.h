@@ -262,6 +262,11 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d);
 @interface NVMTLCommandBuffer () { @public NSString *_label; uint64_t _rep; } @end
 @interface NVMTLCommandBuffer () { @public NSMutableSet *_stTwins; } @end
 @interface NVMTLTexture () { @public nvk_image _stTwin; BOOL _stTwinTried; BOOL _mipsWritten; } @end
+@interface NVMTLTexture () { @public BOOL _tpark; uint32_t _tpkey[12]; } @end   // plain Private texture: its image goes back to the texture park when it dies
+int  nvmtl_texpark_enabled(void);
+int  nvmtl_texpark_take(const uint32_t *key, nvk_image *out);
+void nvmtl_texpark_put(nvk_image *img, const uint32_t *key);
+unsigned nvmtl_texpark_drain(void);
 @interface NVMTLDepthStencilState () { @public NSString *_label; } @end
 @interface NVMTLSamplerState () { @public NSString *_label; } @end
 @interface NVMTLComputePipelineState () { @public NSString *_label; } @end

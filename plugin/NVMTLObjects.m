@@ -765,6 +765,83 @@ static void nvmtl_bpark_put(NVMTLBuffer *b, nvk_image *img, const uint32_t *key)
     if (parked) { memset(img, 0, sizeof *img); atomic_fetch_add(&gBTParked, 1); }
     if (evict) { nvmtl_vk_image_destroy(&ev); atomic_fetch_add(&gBTEvicted, 1); }
 }
+// Creating an image costs four kernel round trips (vkAllocateMemory, vkBindImageMemory2, and the same two again to free it):
+// about 8 ms for a 1080p texture and 17 ms for a 2048x2048 mipmapped one, on the calling thread. An app that makes and drops
+// textures of one shape every frame (video frames, render targets, scratch textures) paid that every time. A dead texture's image is kept here, by exact shape, and handed to the next texture of that shape. Its contents are whatever the
+// last texture left, as with heap textures, and the layout is reset when it is handed out.
+#define NVMTL_TEXPARK_N     16
+#define NVMTL_TEXPARK_BYTES (1024ull << 20)
+typedef struct { nvk_image img; uint32_t key[12]; uint64_t at; } nvmtl_texpark_t;
+static nvmtl_texpark_t g_tp[NVMTL_TEXPARK_N];
+static unsigned g_ntp; static uint64_t g_tpbytes;
+static os_unfair_lock g_tpl = OS_UNFAIR_LOCK_INIT;
+static _Atomic uint64_t gTPRecycled, gTPParked, gTPEvicted;
+static _Atomic int g_tpsweep;
+// Images nobody took within 2 s go back, so an idle process (WindowServer included) does not sit on up to a GiB of VRAM.
+static void nvmtl_texpark_sweep(void *unused) {
+    (void)unused;
+    const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    nvk_image out[NVMTL_TEXPARK_N]; unsigned n = 0;
+    os_unfair_lock_lock(&g_tpl);
+    while (g_ntp && now - g_tp[0].at > 2000000000ull) {
+        out[n++] = g_tp[0].img; g_tpbytes -= g_tp[0].img.alloc;
+        memmove(&g_tp[0], &g_tp[1], (size_t)(g_ntp - 1) * sizeof g_tp[0]); g_ntp--; }
+    const int more = g_ntp != 0;
+    if (!more) atomic_store(&g_tpsweep, 0);
+    os_unfair_lock_unlock(&g_tpl);
+    for (unsigned k = 0; k < n; k++) { nvmtl_vk_image_destroy(&out[k]); atomic_fetch_add(&gTPEvicted, 1); }
+    if (more) dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 1000000000ll), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), NULL, nvmtl_texpark_sweep);
+}
+int nvmtl_texpark_enabled(void) {
+    static int on = -1;
+    if (on < 0) { on = !getenv("NVMTL_NO_TEXPARK");
+        nvlog("texture park: %s (NVMTL_NO_TEXPARK=%s)", on ? "a dead texture's image (colour, depth or multisample) is reused by the next texture of its exact shape" : "OFF - every dead texture frees its image",
+              getenv("NVMTL_NO_TEXPARK") ?: "unset"); }
+    return on;
+}
+int nvmtl_texpark_take(const uint32_t *key, nvk_image *out) {
+    int got = -1;
+    os_unfair_lock_lock(&g_tpl);
+    for (unsigned k = g_ntp; k-- > 0; ) {
+        if (memcmp(g_tp[k].key, key, sizeof g_tp[k].key)) continue;
+        *out = g_tp[k].img; g_tpbytes -= g_tp[k].img.alloc;
+        memmove(&g_tp[k], &g_tp[k + 1], (size_t)(g_ntp - k - 1) * sizeof g_tp[k]); g_ntp--; got = 0; break;
+    }
+    os_unfair_lock_unlock(&g_tpl);
+    if (!got) { const uint64_t n = atomic_fetch_add(&gTPRecycled, 1) + 1;
+                if (!(n & (n - 1))) nvlog("texture park: %llu recycled, %llu parked, %llu evicted", (unsigned long long)n,
+                                          (unsigned long long)atomic_load(&gTPParked), (unsigned long long)atomic_load(&gTPEvicted)); }
+    return got;
+}
+void nvmtl_texpark_put(nvk_image *img, const uint32_t *key) {
+    // Leave anything that is not plainly ours to the caller, which then destroys it: an image in someone else's memory, one the
+    // residency manager moved to system memory, or one too big to be worth holding.
+    if (!img->img || img->placed || img->sysmem || !img->alloc || img->alloc > NVMTL_TEXPARK_BYTES / 2) return;
+    nvmtl_vk_image_upload_barrier(img);   // an async upload must finish before this image can belong to another texture
+    nvk_image ev[NVMTL_TEXPARK_N + 1]; unsigned nev = 0;
+    os_unfair_lock_lock(&g_tpl);
+    while (g_ntp && (g_ntp >= NVMTL_TEXPARK_N || g_tpbytes + img->alloc > NVMTL_TEXPARK_BYTES)) {
+        ev[nev++] = g_tp[0].img; g_tpbytes -= g_tp[0].img.alloc;
+        memmove(&g_tp[0], &g_tp[1], (size_t)(g_ntp - 1) * sizeof g_tp[0]); g_ntp--; }
+    g_tp[g_ntp].img = *img; memcpy(g_tp[g_ntp].key, key, sizeof g_tp[g_ntp].key); g_tp[g_ntp].at = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    g_ntp++; g_tpbytes += img->alloc;
+    const int arm = !atomic_exchange(&g_tpsweep, 1);
+    os_unfair_lock_unlock(&g_tpl);
+    if (arm) dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 2000000000ll), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), NULL, nvmtl_texpark_sweep);
+    memset(img, 0, sizeof *img);
+    atomic_fetch_add(&gTPParked, 1);
+    for (unsigned k = 0; k < nev; k++) { nvmtl_vk_image_destroy(&ev[k]); atomic_fetch_add(&gTPEvicted, 1); }
+}
+unsigned nvmtl_texpark_drain(void) {   // memory ran out: give the parked images back
+    nvk_image out[NVMTL_TEXPARK_N]; unsigned n;
+    os_unfair_lock_lock(&g_tpl);
+    n = g_ntp; for (unsigned k = 0; k < n; k++) out[k] = g_tp[k].img;
+    g_ntp = 0; g_tpbytes = 0;
+    os_unfair_lock_unlock(&g_tpl);
+    for (unsigned k = 0; k < n; k++) nvmtl_vk_image_destroy(&out[k]);
+    if (n) nvlog("texture park: allocation failed - drained %u parked image(s)", n);
+    return n;
+}
 static NVMTLTexture *nvmtl_texbuf_make(NVMTLBuffer *b, MTLTextureDescriptor *d, NSUInteger offset)
 {
     extern int nvmtl_pixfmt_public(MTLPixelFormat f, uint32_t *vk, uint32_t *bpp, int *a8);
@@ -1184,6 +1261,7 @@ void nvmtl_texture_desc_swizzle(NVMTLTexture *t, MTLTextureDescriptor *d) {
     if (_swzView) nvmtl_vk_image_view_destroy(_swzView);
     if (!_parent && _parkable && _subHeap && _i.img) nvmtl_heap_park(_subHeap, &_i, _pkey, _heapOffset, _pkLen);
     if (!_parent && _bparkable && _backBuf && _i.img) nvmtl_bpark_put(_backBuf, &_i, _pkey);
+    if (!_parent && _tpark && _i.img) nvmtl_texpark_put(&_i, _tpkey);
     if (!_parent) nvmtl_vk_image_destroy(&_i);
     if (_stTwin.img) nvmtl_vk_image_destroy(&_stTwin);
     if (!_parent && _vramOn) { nvmtl_vram_put(&_vramBuf); _vramOn = NO; }

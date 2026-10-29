@@ -933,8 +933,16 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
     if (nvmtl_depthfmt(d.pixelFormat, &dvk, &dasp) == 0) {
         t->_q = nvmtl_device_queue();
         const uint32_t dtt = (uint32_t)d.textureType, dms = (d.textureType == MTLTextureType2DMultisample || dtt == 8) ? (uint32_t)d.sampleCount : 1u;
-        if (nvmtl_vk_depth_create_full((uint32_t)d.width, (uint32_t)d.height, dvk, dasp, dms, dtt,
-                                       nvmtl_vk_layers_for_desc(dtt, (uint32_t)d.arrayLength, 1u), (uint32_t)(d.mipmapLevelCount ? d.mipmapLevelCount : 1), &t->_i)) { nvlog("depth texture FAILED (format %lu)", (unsigned long)d.pixelFormat); return nil; }
+        const uint32_t dLayers = nvmtl_vk_layers_for_desc(dtt, (uint32_t)d.arrayLength, 1u), dMips = (uint32_t)(d.mipmapLevelCount ? d.mipmapLevelCount : 1);
+        const uint32_t dpk[12] = { (uint32_t)d.width, (uint32_t)d.height, dvk, dasp, dms, dMips, 0, dtt, dLayers, 0, 1, 0 };
+        const BOOL dpOk = nvmtl_texpark_enabled();
+        if (dpOk && nvmtl_texpark_take(dpk, &t->_i) == 0) t->_i.layout = 0;
+        else {
+            int bad = nvmtl_vk_depth_create_full((uint32_t)d.width, (uint32_t)d.height, dvk, dasp, dms, dtt, dLayers, dMips, &t->_i);
+            if (bad && dpOk && nvmtl_texpark_drain()) bad = nvmtl_vk_depth_create_full((uint32_t)d.width, (uint32_t)d.height, dvk, dasp, dms, dtt, dLayers, dMips, &t->_i);
+            if (bad) { nvlog("depth texture FAILED (format %lu)", (unsigned long)d.pixelFormat); return nil; }
+        }
+        if (dpOk) { t->_tpark = YES; memcpy(t->_tpkey, dpk, sizeof dpk); }
         t->_usage = d.usage;
         nvlog("newTextureWithDescriptor: %lux%lu DEPTH32F type %lu layers %u mips %u -> %p", (unsigned long)d.width, (unsigned long)d.height, (unsigned long)d.textureType, t->_i.layers, t->_i.mips, (__bridge void *)t);
         return t;
@@ -946,9 +954,30 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
         if (d.mipmapLevelCount != 1 || d.depth != 1) { nvlog("newTextureWithDescriptor: invalid multisample color descriptor"); return nil; }
         if (wantStex) { static _Atomic unsigned long msw; const unsigned long k = atomic_fetch_add(&msw, 1) + 1;
             if (!(k & (k - 1))) nvlog("newTextureWithDescriptor: %lu multisample texture(s) asked for ShaderWrite - created like Apple (M1/D300 create them); no storage view", k); }
-        if (nvmtl_vk_image_create_ms_full((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, (uint32_t)d.sampleCount, (uint32_t)d.textureType, (uint32_t)d.arrayLength, &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED (multisample)"); return nil; }
-    } else
-    if (nvmtl_vk_image_create_typed((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, (uint32_t)d.mipmapLevelCount, wantStex, (uint32_t)d.textureType, nvmtl_vk_layers_for_desc((uint32_t)d.textureType, (uint32_t)d.arrayLength, (uint32_t)d.depth), &t->_i)) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED"); return nil; }
+        {
+            const uint32_t mpk[12] = { (uint32_t)d.width, (uint32_t)d.height, vkf, bpp, (uint32_t)d.sampleCount, 1, 0, (uint32_t)d.textureType, (uint32_t)d.arrayLength, 0, 2, 0 };
+            const BOOL mpOk = nvmtl_texpark_enabled();
+            if (mpOk && nvmtl_texpark_take(mpk, &t->_i) == 0) t->_i.layout = 0;
+            else {
+                int bad = nvmtl_vk_image_create_ms_full((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, (uint32_t)d.sampleCount, (uint32_t)d.textureType, (uint32_t)d.arrayLength, &t->_i);
+                if (bad && mpOk && nvmtl_texpark_drain()) bad = nvmtl_vk_image_create_ms_full((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, (uint32_t)d.sampleCount, (uint32_t)d.textureType, (uint32_t)d.arrayLength, &t->_i);
+                if (bad) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED (multisample)"); return nil; }
+            }
+            if (mpOk) { t->_tpark = YES; memcpy(t->_tpkey, mpk, sizeof mpk); }
+        }
+    } else {
+        const uint32_t tpLayers = nvmtl_vk_layers_for_desc((uint32_t)d.textureType, (uint32_t)d.arrayLength, (uint32_t)d.depth);
+        const uint32_t tpk[12] = { (uint32_t)d.width, (uint32_t)d.height, vkf, bpp, (uint32_t)a8, (uint32_t)d.mipmapLevelCount, (uint32_t)wantStex,
+                                   (uint32_t)d.textureType, tpLayers, 0, 0, 0 };
+        const BOOL tpOk = nvmtl_texpark_enabled();
+        if (tpOk && nvmtl_texpark_take(tpk, &t->_i) == 0) t->_i.layout = 0;
+        else {
+            int bad = nvmtl_vk_image_create_typed((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, (uint32_t)d.mipmapLevelCount, wantStex, (uint32_t)d.textureType, tpLayers, &t->_i);
+            if (bad && tpOk && nvmtl_texpark_drain()) bad = nvmtl_vk_image_create_typed((uint32_t)d.width, (uint32_t)d.height, vkf, bpp, a8, (uint32_t)d.mipmapLevelCount, wantStex, (uint32_t)d.textureType, tpLayers, &t->_i);
+            if (bad) { nvmtl_alloc_failed("newTextureWithDescriptor"); nvlog("newTextureWithDescriptor: FAILED"); return nil; }
+        }
+        if (tpOk) { t->_tpark = YES; memcpy(t->_tpkey, tpk, sizeof tpk); }
+    }
     nvmtl_alloc_ok();
     t->_q = nvmtl_device_queue();
     t->_stex = t->_i.storage != 0;
