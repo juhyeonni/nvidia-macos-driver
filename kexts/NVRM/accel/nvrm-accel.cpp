@@ -1844,6 +1844,33 @@ static IOReturn nvAccelSurfVram(struct NVRMSurfShareEsc *p, task_t task, unsigne
         ((OSObject *)surf)->release();
         return kIOReturnSuccess;
     }
+    // A first import backs the surface with VRAM: wire -> allocPhysical -> the framebuffer's grant, tens of ms for a
+    // window-sized surface. Under the family lock that held up every other process's surface marks, WindowServer's
+    // compositor first (missed frames system-wide). The VRAM is taken with the lock dropped and handed to wire through
+    // the park slot, so wire only adopts it; memory that turns out not to be needed is given back after the unlock.
+    struct NVRMVramRequest spare; nvSVZero(&spare, sizeof spare);
+    if (vm && !vm->fRmHandle && !vm->fScanout && !vm->fParkHandle && cache) {
+        const unsigned long long want = *(volatile unsigned long long *)((unsigned char *)vm + 0x40);
+        if (want) {
+            NVVidMemory *const before = vm;
+            before->retain();
+            nvFamUnlock(a);
+            struct NVRMVramRequest r; nvSVZero(&r, sizeof r);
+            r.version = NVRM_VRAM_ABI_VERSION; r.size = want;
+            const bool got = a->askFramebufferForVram(&r, true) == kIOReturnSuccess && r.handle && r.phys;
+            nvFamLock(a, false);
+            OSObject *c2 = *(OSObject *volatile *)((unsigned char *)cache + 0x20);
+            res = OSDynamicCast(NVResource, c2);
+            vm = res ? nvres_vidmem(res) : nullptr;
+            if (got) {
+                if (vm == before && !vm->fRmHandle && !vm->fParkHandle && r.actualSize >= want) {
+                    vm->fParkHandle = r.handle; vm->fParkKva = r.kva; vm->fParkPhys = r.phys;
+                    vm->fParkBytes = r.actualSize; vm->fParkCookie = r.allocationCookie;
+                } else spare = r;
+            }
+            before->release();
+        }
+    }
     if (vm && !vm->fRmHandle && !vm->fScanout) _ZN16IOAccelVidMemory4wireEv(vm);
     if (!cache || !res) p->status = NVRM_SS_NO_CACHE;
     else if (!vm || !vm->fRmHandle || !vm->fBytes) p->status = NVRM_SS_NO_VRAM;
@@ -1864,6 +1891,7 @@ static IOReturn nvAccelSurfVram(struct NVRMSurfShareEsc *p, task_t task, unsigne
              p->surfaceID, p->plane, cache, res, vm, vm ? vm->fBytes : 0ull, p->hSrcClient, p->hSrcMemory, p->status, gNVSVOk, gNVSVRefused);
     if (cache) ((OSObject *)cache)->release();
     nvFamUnlock(a);
+    if (spare.handle) { spare.version = NVRM_VRAM_ABI_VERSION; a->askFramebufferForVram(&spare, false); }
     ((OSObject *)surf)->release();
     return kIOReturnSuccess;
 }
