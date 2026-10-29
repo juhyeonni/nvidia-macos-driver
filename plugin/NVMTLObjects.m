@@ -769,28 +769,42 @@ static void nvmtl_bpark_put(NVMTLBuffer *b, nvk_image *img, const uint32_t *key)
 // about 8 ms for a 1080p texture and 17 ms for a 2048x2048 mipmapped one, on the calling thread. An app that makes and drops
 // textures of one shape every frame (video frames, render targets, scratch textures) paid that every time. A dead texture's image is kept here, by exact shape, and handed to the next texture of that shape. Its contents are whatever the
 // last texture left, as with heap textures, and the layout is reset when it is handed out.
-#define NVMTL_TEXPARK_N     16
-#define NVMTL_TEXPARK_BYTES (1024ull << 20)
+// Counted in images as well as bytes: a page drops dozens of small textures between two uses of its big attachments, and at
+// 16 or 32 entries those pushed the big ones out (a 7 s old 3072x3072 pair missed with the byte budget half empty).
+#define NVMTL_TEXPARK_N     256
+// Skia Graphite in Brave keeps 4x MSAA attachments in several sizes (3072x3072 depth/stencil alone is 189 MB, about 1.2 GB for
+// the set) and drops them between interactions; a miss costs 35-70 ms. An eighth of VRAM holds the set, between 1 and 2 GB;
+// an allocation that runs out of VRAM drains the park first.
+static uint64_t nvmtl_texpark_bytes(void) {
+    static uint64_t b;
+    if (!b) { const uint64_t v = nvmtl_vk_vram_bytes() / 8; b = v < (1ull << 30) ? (1ull << 30) : v > (2ull << 30) ? (2ull << 30) : v; }
+    return b;
+}
+#define NVMTL_TEXPARK_BYTES nvmtl_texpark_bytes()
+#define NVMTL_TEXPARK_IDLE_NS 10000000000ull
 typedef struct { nvk_image img; uint32_t key[12]; uint64_t at; } nvmtl_texpark_t;
 static nvmtl_texpark_t g_tp[NVMTL_TEXPARK_N];
 static unsigned g_ntp; static uint64_t g_tpbytes;
 static os_unfair_lock g_tpl = OS_UNFAIR_LOCK_INIT;
 static _Atomic uint64_t gTPRecycled, gTPParked, gTPEvicted;
 static _Atomic int g_tpsweep;
-// Images nobody took within 2 s go back, so an idle process (WindowServer included) does not sit on up to a GiB of VRAM.
+// Images nobody took within 10 s go back, so an idle process (WindowServer included) does not keep holding the park. A
+// browser touched every few seconds (typing, clicking) keeps its attachments; at 2 s each interaction reallocated them.
+// One image per pass, 50 ms apart: freeing a 190 MB attachment holds RM's lock for tens of ms, and a batch of them back to
+// back held up other processes' display flips (more missed frames system-wide).
 static void nvmtl_texpark_sweep(void *unused) {
     (void)unused;
     const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    nvk_image out[NVMTL_TEXPARK_N]; unsigned n = 0;
+    nvk_image out = {0}; int got = 0;
     os_unfair_lock_lock(&g_tpl);
-    while (g_ntp && now - g_tp[0].at > 2000000000ull) {
-        out[n++] = g_tp[0].img; g_tpbytes -= g_tp[0].img.alloc;
+    if (g_ntp && now - g_tp[0].at > NVMTL_TEXPARK_IDLE_NS) {
+        out = g_tp[0].img; g_tpbytes -= g_tp[0].img.alloc; got = 1;
         memmove(&g_tp[0], &g_tp[1], (size_t)(g_ntp - 1) * sizeof g_tp[0]); g_ntp--; }
-    const int more = g_ntp != 0;
+    const int more = g_ntp != 0, due = more && now - g_tp[0].at > NVMTL_TEXPARK_IDLE_NS;
     if (!more) atomic_store(&g_tpsweep, 0);
     os_unfair_lock_unlock(&g_tpl);
-    for (unsigned k = 0; k < n; k++) { nvmtl_vk_image_destroy(&out[k]); atomic_fetch_add(&gTPEvicted, 1); }
-    if (more) dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 1000000000ll), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), NULL, nvmtl_texpark_sweep);
+    if (got) { nvmtl_vk_image_destroy(&out); atomic_fetch_add(&gTPEvicted, 1); }
+    if (more) dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, due ? 50000000ll : 1000000000ll), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), NULL, nvmtl_texpark_sweep);
 }
 int nvmtl_texpark_enabled(void) {
     static int on = -1;
@@ -827,7 +841,7 @@ void nvmtl_texpark_put(nvk_image *img, const uint32_t *key) {
     g_ntp++; g_tpbytes += img->alloc;
     const int arm = !atomic_exchange(&g_tpsweep, 1);
     os_unfair_lock_unlock(&g_tpl);
-    if (arm) dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 2000000000ll), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), NULL, nvmtl_texpark_sweep);
+    if (arm) dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NVMTL_TEXPARK_IDLE_NS), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), NULL, nvmtl_texpark_sweep);
     memset(img, 0, sizeof *img);
     atomic_fetch_add(&gTPParked, 1);
     for (unsigned k = 0; k < nev; k++) { nvmtl_vk_image_destroy(&ev[k]); atomic_fetch_add(&gTPEvicted, 1); }
