@@ -16,6 +16,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <time.h>
 #include <os/lock.h>
 extern char **environ;
@@ -102,13 +103,22 @@ typedef int (*nvmtl_promote_uniform_fn)(const uint8_t *, size_t, uint32_t, uint3
 static nvmtl_promote_uniform_fn xlate_promote_uniform;
 static char kNVMTLTableFns;
 
+static NSString *nvmtl_spvcache_dir(void);
+static void nvmtl_prewarm_schedule(NSString *spvDir);
+static const char *nvmtl_xlate_path(void) {
+    static char path[PATH_MAX]; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Dl_info info; NSString *bundled = nil;
+        if (dladdr((const void *)&nvmtl_xlate_path, &info) && info.dli_fname)
+            bundled = [[@(info.dli_fname) stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"libnvmtl_translate.dylib"];
+        strlcpy(path, bundled && access(bundled.fileSystemRepresentation, R_OK) == 0 ? bundled.fileSystemRepresentation : NVMTL_XLATE_LIB, sizeof path);
+    });
+    return path;
+}
 static int nvmtl_xlate_ready(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        Dl_info info; NSString *bundled = nil;
-        if (dladdr((const void *)&nvmtl_xlate_ready, &info) && info.dli_fname)
-            bundled = [[@(info.dli_fname) stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"libnvmtl_translate.dylib"];
-        const char *xpath = bundled && access(bundled.fileSystemRepresentation,R_OK)==0 ? bundled.fileSystemRepresentation : NVMTL_XLATE_LIB;
+        const char *xpath = nvmtl_xlate_path();
         void *h = dlopen(xpath, RTLD_NOW | RTLD_LOCAL);
         if (h) nvmtl_translator_cache_tag(xpath, gXlateTag, sizeof gXlateTag);
         if (!getenv("NVMTL_NO_AIR_UNROLL")) strlcat(gXlateTag, "-u2", sizeof gXlateTag);
@@ -145,6 +155,10 @@ static int nvmtl_xlate_ready(void) {
         if (!xlate) { nvlog("translate: no nvmtl_translate symbol"); return; }
         nvlog("translate: in-process AIR->SPIR-V library loaded");
     });
+    // The pre-translation is scheduled when the translator is opened, not at the first cache lookup: a process served
+    // whole from the library index cache never looks one up.
+    static dispatch_once_t prewarmOnce;
+    if (xlate) dispatch_once(&prewarmOnce, ^{ NSString *d = nvmtl_spvcache_dir(); if (d) nvmtl_prewarm_schedule(d); });
     return xlate != NULL;
 }
 
@@ -517,6 +531,204 @@ static BOOL nvmtl_is_spirv(NSData *d) {
     if (d.length < 20 || d.length % 4) return NO;
     memcpy(&magic, d.bytes, 4);
     return magic == 0x07230203;
+}
+#pragma mark - pre-translation after a translator update
+/* A cache entry is named by its input digest plus the translator build, so after a driver update every shader is
+ * translated again on first use while an app waits: iconservicesagent drawing the icons of Alfred's result list held
+ * Alfred's main thread ~0.9 s, and the login after an update translated for 107 s (the sweep above).
+ * Each miss leaves a recipe beside the cache (spvrecipe/<digest>.<stage>.plist, the AIR text once in spvrecipe/air),
+ * and the first process of a new build to take the folder's lock translates, on a utility queue a few seconds after
+ * its first lookup, every recipe whose entry is missing. NVMTL_PREWARM=0 (or nvrm610.conf), or a file named "off" in
+ * spvrecipe, stops both. */
+#define NVMTL_RECIPE_MAX 8192
+#define NVMTL_RECIPE_AIR_MAX (256ull << 20)
+static int nvmtl_reflect_air_fc(NSDictionary *fc, NSString *name, NSString *ll, NSString *stage,
+                                uint8_t **j, size_t *jn, char *e, size_t elen);
+BOOL nvmtl_needs_visible_link(NSString *air, NSString *why);
+NSData *nvmtl_translate_variant_uncached(NVMTLFunction *fn, NSDictionary *states, NSDictionary *tgLen, NSString **err);
+static NSString *nvmtl_recipe_dir(NSString *spvDir) {
+    return [[spvDir stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"spvrecipe"];
+}
+static BOOL nvmtl_prewarm_on(NSString *recDir) {
+    const char *v = getenv("NVMTL_PREWARM");
+    if (v && !strcmp(v, "0")) return NO;
+    return access([recDir stringByAppendingPathComponent:@"off"].fileSystemRepresentation, F_OK) != 0;
+}
+static NSArray *nvmtl_recipe_fc_args(const uint32_t *idx, const uint32_t *sizes, const uint8_t *const *payloads, size_t n) {
+    NSMutableArray *a = [NSMutableArray arrayWithCapacity:n];
+    for (size_t k = 0; k < n; k++) {
+        NSMutableDictionary *c = [@{ @"i": @(idx[k]), @"s": @(sizes[k]) } mutableCopy];
+        if (payloads[k]) c[@"v"] = [NSData dataWithBytes:payloads[k] length:sizes[k]];
+        [a addObject:c];
+    }
+    return a;
+}
+static void nvmtl_recipe_store(NSString *recDir, NSString *name, NSString *kind, NSString *ll, NSString *stage, NSDictionary *args) {
+    static unsigned long count; static unsigned long long airBytes; static BOOL counted;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *airDir = [recDir stringByAppendingPathComponent:@"air"];
+    if (!counted) {
+        counted = YES;
+        [fm createDirectoryAtPath:airDir withIntermediateDirectories:YES attributes:nil error:nil];
+        count = [fm contentsOfDirectoryAtPath:recDir error:nil].count;
+        for (NSString *f in [fm contentsOfDirectoryAtPath:airDir error:nil])
+            airBytes += [[fm attributesOfItemAtPath:[airDir stringByAppendingPathComponent:f] error:nil] fileSize];
+    }
+    NSString *file = [recDir stringByAppendingPathComponent:[name stringByAppendingString:@".plist"]];
+    if (count >= NVMTL_RECIPE_MAX || access(file.fileSystemRepresentation, F_OK) == 0) return;
+    NSData *air = [ll dataUsingEncoding:NSUTF8StringEncoding];
+    if (!air) return;
+    unsigned char h[CC_SHA256_DIGEST_LENGTH]; char hex[2 * CC_SHA256_DIGEST_LENGTH + 1];
+    CC_SHA256(air.bytes, (CC_LONG)air.length, h);
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) snprintf(hex + 2 * i, 3, "%02x", h[i]);
+    NSString *airFile = [airDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%s.ll", hex]];
+    if (access(airFile.fileSystemRepresentation, F_OK) != 0) {
+        if (airBytes + air.length > NVMTL_RECIPE_AIR_MAX || ![air writeToFile:airFile atomically:YES]) return;
+        airBytes += air.length;
+    }
+    NSDictionary *r = @{ @"kind": kind, @"air": @(hex), @"stage": stage, @"args": args ?: @{} };
+    NSData *pl = [NSPropertyListSerialization dataWithPropertyList:r format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
+    if (pl && [pl writeToFile:file atomically:YES]) count++;
+}
+// Called after a miss was translated and its entry is being stored at path.
+static void nvmtl_recipe_note(NSString *path, NSString *kind, NSString *ll, NSString *stage, NSDictionary *args) {
+    NSString *suffix = [NSString stringWithFormat:@".%s.c3.spv", gXlateTag], *f = path.lastPathComponent;
+    if (!f || !ll || ![f hasSuffix:suffix]) return;
+    NSString *recDir = nvmtl_recipe_dir(path.stringByDeletingLastPathComponent);
+    if (!nvmtl_prewarm_on(recDir)) return;
+    NSString *name = [f substringToIndex:f.length - suffix.length], *text = [ll copy], *st = [stage ?: @"" copy];
+    NSDictionary *a = [args copy];
+    nvmtl_cache_io(^{ @autoreleasepool { nvmtl_recipe_store(recDir, name, kind, text, st, a); } });
+}
+static NSData *nvmtl_recipe_run(NSDictionary *r, NSString *ll) {
+    NSString *kind = r[@"kind"], *stage = r[@"stage"]; NSDictionary *a = r[@"args"];
+    if (![kind isKindOfClass:[NSString class]] || ![stage isKindOfClass:[NSString class]] || ![a isKindOfClass:[NSDictionary class]]) return nil;
+    uint8_t *out = NULL; size_t len = 0; char e[512] = { 0 }; int rc = -1;
+    if ([kind isEqual:@"variant"]) {   // a compute function respecialized for its sampler states / threadgroup lengths
+        NVMTLFunction *fn = [NVMTLFunction new];
+        fn->_air = ll; fn->_stage = stage; fn->_fname = @"prewarm";
+        fn->_fc = [a[@"fc"] isKindOfClass:[NSDictionary class]] ? a[@"fc"] : @{};
+        NSDictionary *st = [a[@"samplers"] isKindOfClass:[NSDictionary class]] ? a[@"samplers"] : @{};
+        NSDictionary *tg = [a[@"threadgroup"] isKindOfClass:[NSDictionary class]] ? a[@"threadgroup"] : @{};
+        if (!st.count && !tg.count) return nil;
+        NSData *d = nvmtl_translate_variant_uncached(fn, st, tg, NULL);
+        return nvmtl_is_spirv(d) ? d : nil;
+    }
+    if ([kind isEqual:@"refl"]) {
+        rc = xlate_refl ? nvmtl_reflect_air_fc(a[@"fc"], @"prewarm", ll, stage, &out, &len, e, sizeof e) : -1;
+    } else if ([kind isEqual:@"plain"]) {
+        if (xlate) rc = xlate(ll.UTF8String, stage.UTF8String, &out, &len, e, sizeof e);
+    } else if ([kind isEqual:@"sampler"]) {
+        if (xlate_sampler && [a[@"key"] isKindOfClass:[NSString class]])
+            rc = xlate_sampler(ll.UTF8String, stage.UTF8String, [a[@"key"] UTF8String], &out, &len, e, sizeof e);
+    } else if ([kind isEqual:@"fc"] || [kind isEqual:@"fclink"]) {
+        NSArray *fc = a[@"fc"]; size_t n = [fc isKindOfClass:[NSArray class]] ? fc.count : 0;
+        uint32_t idx[n ? n : 1], sz[n ? n : 1]; const uint8_t *pay[n ? n : 1];
+        for (size_t k = 0; k < n; k++) {
+            NSDictionary *c = fc[k]; NSData *v = c[@"v"];
+            idx[k] = [c[@"i"] unsignedIntValue]; sz[k] = [c[@"s"] unsignedIntValue];
+            if (v && v.length != sz[k]) return nil;
+            pay[k] = v ? v.bytes : NULL;
+        }
+        // a function kept without its stage fails before translation, as nvmtl_translate_with_fc does
+        if (xlate_fc && stage.length) rc = xlate_fc(ll.UTF8String, stage.UTF8String, idx, sz, pay, n, &out, &len, e, sizeof e);
+        // a specialization that stops at an unlinked visible-function call: its entry is the mark that says so
+        if ([kind isEqual:@"fclink"]) {
+            if (out && xlate_free) xlate_free(out, len);
+            return rc != 0 && nvmtl_needs_visible_link(ll, @(e)) ? [@"LINK" dataUsingEncoding:NSUTF8StringEncoding] : nil;
+        }
+    }
+    if (rc != 0) { if (out && xlate_free) xlate_free(out, len); return nil; }
+    NSData *d = [NSData dataWithBytes:out length:len];
+    if (xlate_free) xlate_free(out, len);
+    if ([kind isEqual:@"refl"]) {
+        id obj = d.length ? [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL] : nil;
+        return ([obj isKindOfClass:[NSDictionary class]] && [(NSDictionary *)obj count]) ? d : nil;
+    }
+    return nvmtl_is_spirv(d) ? d : nil;
+}
+static void nvmtl_prewarm_run(NSString *spvDir) {
+    NSString *recDir = nvmtl_recipe_dir(spvDir);
+    if (!nvmtl_prewarm_on(recDir) || !nvmtl_xlate_ready() || !strcmp(gXlateTag, "untagged")) return;
+    NSString *marker = [spvDir stringByAppendingPathComponent:[NSString stringWithFormat:@"prewarm.%s.done", gXlateTag]];
+    if (access(marker.fileSystemRepresentation, F_OK) == 0) return;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *files = [fm contentsOfDirectoryAtPath:recDir error:nil];
+    if (!files.count || ![fm createDirectoryAtPath:spvDir withIntermediateDirectories:YES attributes:nil error:nil]) return;
+    const int fd = open([recDir stringByAppendingPathComponent:@".lock"].fileSystemRepresentation, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    // Waits for a process already at it rather than leaving: short-lived XPC services take the lock too and can exit
+    // half way; what they translated stays, and whoever gets the lock next carries on and writes the marker.
+    if (flock(fd, LOCK_EX) != 0 || access(marker.fileSystemRepresentation, F_OK) == 0) { close(fd); return; }
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+    unsigned long made = 0, present = 0, failed = 0;
+    for (NSString *f in files) @autoreleasepool {
+        if (![f hasSuffix:@".plist"]) continue;
+        NSString *out = [spvDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.%s.c3.spv", f.stringByDeletingPathExtension, gXlateTag]];
+        if (access(out.fileSystemRepresentation, F_OK) == 0) { present++; continue; }
+        NSData *pl = [NSData dataWithContentsOfFile:[recDir stringByAppendingPathComponent:f]];
+        NSDictionary *r = pl ? [NSPropertyListSerialization propertyListWithData:pl options:0 format:NULL error:NULL] : nil;
+        NSString *airName = [r isKindOfClass:[NSDictionary class]] ? r[@"air"] : nil;
+        NSData *air = [airName isKindOfClass:[NSString class]]
+            ? [NSData dataWithContentsOfFile:[[recDir stringByAppendingPathComponent:@"air"] stringByAppendingPathComponent:[airName stringByAppendingString:@".ll"]]] : nil;
+        NSString *ll = air ? [[NSString alloc] initWithData:air encoding:NSUTF8StringEncoding] : nil;
+        NSData *d = ll ? nvmtl_recipe_run(r, ll) : nil;
+        if (d && [d writeToFile:out atomically:YES]) made++; else failed++;
+    }
+    NSString *note = [NSString stringWithFormat:@"translated %lu, already present %lu, failed %lu, %.0f ms, %s pid %d\n", made, present, failed,
+                      (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - t0) / 1e6, getprogname(), getpid()];
+    [note writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    nvlog("prewarm: %s", note.UTF8String);
+    flock(fd, LOCK_UN); close(fd);
+}
+// Checks one entry folder: a stat of the translator, and its tag (a hash of the whole file) only when the stat differs
+// from the one recorded beside the recipes or the folder has no marker for that tag.
+static void nvmtl_prewarm_folder(NSString *spv) {
+    NSString *rec = nvmtl_recipe_dir(spv);
+    if (!nvmtl_prewarm_on(rec) || access(rec.fileSystemRepresentation, F_OK) != 0) return;
+    struct stat st;
+    if (stat(nvmtl_xlate_path(), &st) != 0) return;
+    NSString *stamp = [NSString stringWithFormat:@"%llu:%llu:%lld:%ld", (unsigned long long)st.st_dev, (unsigned long long)st.st_ino,
+                       (long long)st.st_size, (long)st.st_mtimespec.tv_sec];
+    NSString *stampFile = [rec stringByAppendingPathComponent:@"translator.stamp"];
+    NSArray *had = [[NSString stringWithContentsOfFile:stampFile encoding:NSUTF8StringEncoding error:nil] componentsSeparatedByString:@" "];
+    NSString *marker = had.count == 2 ? [spv stringByAppendingPathComponent:[NSString stringWithFormat:@"prewarm.%@.done", had[1]]] : nil;
+    if (marker && [had[0] isEqual:stamp] && access(marker.fileSystemRepresentation, F_OK) == 0) return;
+    if (!nvmtl_xlate_ready()) return;
+    nvmtl_prewarm_run(spv);
+    [[NSString stringWithFormat:@"%@ %s", stamp, gXlateTag] writeToFile:stampFile atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+// From device creation, so a process that never translates still notices a new translator (it may be served whole by
+// the library index cache). Besides its own folder it checks the other per-process folders under the user's cache
+// folder: a sandboxed agent such as iconservicesagent opens the GPU only when it must draw, too late to translate ahead
+// for itself, so another process of the session fills its folder. A sandboxed process cannot list them and skips them.
+// App containers are left alone (macOS asks the user before one app reads another's).
+void nvmtl_prewarm_kick(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ @autoreleasepool {
+            NSString *own = nvmtl_spvcache_dir();
+            NSMutableOrderedSet *folders = [NSMutableOrderedSet orderedSet];
+            if (own) [folders addObject:own];
+            char ucd[PATH_MAX]; const size_t n = confstr(_CS_DARWIN_USER_CACHE_DIR, ucd, sizeof ucd);
+            if (n > 0 && n <= sizeof ucd) {
+                NSString *base = @(ucd);
+                for (NSString *e in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:base error:nil]) {
+                    NSString *spv = [base stringByAppendingPathComponent:[e stringByAppendingPathComponent:@"nvmtl/spvcache"]];
+                    if (access([nvmtl_recipe_dir(spv) stringByAppendingPathComponent:@"air"].fileSystemRepresentation, F_OK) == 0) [folders addObject:spv];
+                }
+            }
+            NSString *lib = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"nvmtl/spvcache"];
+            if (lib && access([nvmtl_recipe_dir(lib) stringByAppendingPathComponent:@"air"].fileSystemRepresentation, F_OK) == 0) [folders addObject:lib];
+            for (NSString *spv in folders) @autoreleasepool { nvmtl_prewarm_folder(spv); }
+        } });
+    });
+}
+static void nvmtl_prewarm_schedule(NSString *spvDir) {
+    NSString *d = [spvDir copy];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool { nvmtl_prewarm_run(d); }
+    });
 }
 static NSCache *nvmtl_memo(void) {
     static NSCache *c; static dispatch_once_t once;
@@ -960,6 +1172,7 @@ NSData *nvmtl_compile_library_entry(NSData *air, NSString *ll, NSString *stage, 
                 nvlog("library: translate %s (%s) FAILED: %s", name.UTF8String, stage.UTF8String, err); if (error) *error = @(err); return nil;
             }
             spvData = [NSData dataWithBytes:spv length:spvn];
+            if (spvp && nvmtl_is_spirv(spvData)) nvmtl_recipe_note(spvp, @"plain", ll, stage, nil);
             if (spvp) {
                 NSData *stored = [spvData copy]; NSString *file = [spvp copy];
                 nvmtl_cache_io(^{
@@ -1357,6 +1570,16 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
     NSString *memoKey = path ?: nvmtl_spvcache_memo_key_air(airDigest, json, @"fc1");
     uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
     const BOOL fcCacheOn = !getenv("NVMTL_FCCACHE_OFF");
+    // A specialization that stops at an unlinked visible-function call is deferred to the pipeline link, and it stops
+    // the same way every time for the same input. RenderBox asks for such functions on every icon it draws, so that
+    // failed translation was a full translation each time (~140 ms of every cold icon run). It is remembered like an entry.
+    NSString *linkPath = path ? nvmtl_spvcache_path_air(airDigest, json, @"fc1link") : nil;
+    NSString *linkKey = linkPath ?: nvmtl_spvcache_memo_key_air(airDigest, json, @"fc1link");
+    if (fcCacheOn && g_fc_expect_link &&
+        ([nvmtl_memo() objectForKey:linkKey] || (linkPath && access(linkPath.fileSystemRepresentation, F_OK) == 0))) {
+        if (err) *err = @"visible function reference not linked yet (known from an earlier specialization)";
+        return nil;
+    }
     NSData *hit = fcCacheOn ? [nvmtl_memo() objectForKey:memoKey] : nil;
     if (hit) { gFcHit++; gFcMemoHit++; nvmtl_cache_touch(path); nvmtl_fc_note_lookup(); return hit; }   // keep the trimmer's age order (off the caller)
     if (fcCacheOn && path) hit = [NSData dataWithContentsOfFile:path];
@@ -1375,7 +1598,16 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
     }
     gFcMiss++;
     NSData *result = nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, err);
+    if (!result && fcCacheOn && g_fc_expect_link && nvmtl_needs_visible_link(ll, err ? *err : nil)) {
+        NSData *mark = [@"LINK" dataUsingEncoding:NSUTF8StringEncoding];
+        [nvmtl_memo() setObject:mark forKey:linkKey cost:mark.length];
+        if (linkPath) {
+            NSString *file = [linkPath copy]; nvmtl_cache_io(^{ [mark writeToFile:file atomically:YES]; });
+            nvmtl_recipe_note(linkPath, @"fclink", ll, stage, @{ @"fc": nvmtl_recipe_fc_args(idx, sizes, payloads, n) });
+        }
+    }
     if (result) {
+        if (path && nvmtl_is_spirv(result)) nvmtl_recipe_note(path, @"fc", ll, stage, @{ @"fc": nvmtl_recipe_fc_args(idx, sizes, payloads, n) });
         if (path) {
             NSData *stored = [result copy]; NSString *file = [path copy];
             nvmtl_cache_io(^{ if ([stored writeToFile:file atomically:YES]) gFcStored++; });
@@ -1389,10 +1621,9 @@ NSData *nvmtl_translate_with_fc_cached(NSString *ll, NSString *stage, NSString *
     return result;
 }
 
-static int nvmtl_reflect_air(NVMTLFunction *function, NSString *ll, NSString *stage,
-                             uint8_t **j, size_t *jn, char *e, size_t elen)
+static int nvmtl_reflect_air_fc(NSDictionary *fc, NSString *name, NSString *ll, NSString *stage,
+                                uint8_t **j, size_t *jn, char *e, size_t elen)
 {
-    NSDictionary *fc = function ? function->_fc : nil;
     BOOL have = [fc isKindOfClass:[NSDictionary class]] && fc.count > 0;
     if (have && xlate_refl_fc) {
         NSUInteger capacity = fc.count;
@@ -1413,15 +1644,20 @@ static int nvmtl_reflect_air(NVMTLFunction *function, NSString *ll, NSString *st
         if (n) {
             int rc = xlate_refl_fc(ll.UTF8String, stage.UTF8String, idx, sz, pay, n, j, jn, e, elen);
             nvlog("reflection: %s carried %zu function constant(s) into reflection (rc %d)",
-                  function->_fname.UTF8String ?: "?", n, rc);
+                  name.UTF8String ?: "?", n, rc);
             return rc;
         }
     }
     if (have && !xlate_refl_fc)
         nvlog("reflection: %s carries %lu function constant(s) but this translator exports no "
               "nvmtl_reflect_fc - any binding slot derived from a function constant WILL reflect at 0",
-              function->_fname.UTF8String ?: "?", (unsigned long)fc.count);
+              name.UTF8String ?: "?", (unsigned long)fc.count);
     return xlate_refl(ll.UTF8String, stage.UTF8String, j, jn, e, elen);
+}
+static int nvmtl_reflect_air(NVMTLFunction *function, NSString *ll, NSString *stage,
+                             uint8_t **j, size_t *jn, char *e, size_t elen)
+{
+    return nvmtl_reflect_air_fc(function ? function->_fc : nil, function ? function->_fname : nil, ll, stage, j, jn, e, elen);
 }
 
 static _Atomic unsigned long gRfHit, gRfMiss, gRfStored;
@@ -1456,6 +1692,7 @@ static NSData *nvmtl_reflect_air_cached(NVMTLFunction *function, NSString *ll, N
     if (xlate_free) xlate_free(j, jn);
     id obj = d.length ? [NSJSONSerialization JSONObjectWithData:d options:0 error:NULL] : nil;
     if (path && [obj isKindOfClass:[NSDictionary class]] && [(NSDictionary *)obj count]) {
+        nvmtl_recipe_note(path, @"refl", ll, stage, @{ @"fc": fc });
         NSData *stored = [d copy]; NSString *file = [path copy];
         nvmtl_cache_io(^{ if ([stored writeToFile:file atomically:YES]) gRfStored++; });
     }
@@ -1497,6 +1734,7 @@ static NSData *nvmtl_translate_link_cached(NSString *ll, NSString *stage, const 
     }
     unsigned long mn = ++gLkMiss;
     NSData *result = nvmtl_translate_with_fc(ll, stage, idx, sizes, payloads, n, err);
+    if (result && path && nvmtl_is_spirv(result)) nvmtl_recipe_note(path, @"fc", ll, stage, @{ @"fc": nvmtl_recipe_fc_args(idx, sizes, payloads, n) });
     if (result && path) {
         NSData *stored = [result copy]; NSString *file = [path copy];
         nvmtl_cache_io(^{ if ([stored writeToFile:file atomically:YES]) gLkStored++; });
@@ -1959,6 +2197,8 @@ NSData *nvmtl_translate_variant(NVMTLFunction *fn, NSDictionary *states, NSDicti
     NSData *hit=path?[NSData dataWithContentsOfFile:path]:nil;uint32_t magic=0;
     if(hit.length>=20 && hit.length%4==0){memcpy(&magic,hit.bytes,4);if(magic==0x07230203){[nvmtl_memo() setObject:hit forKey:memoKey cost:hit.length];nvlog("variant cache: hit %s",fn->_fname.UTF8String);return hit;}}
     NSData *result=nvmtl_translate_variant_uncached(fn,states,tgLen,err);
+    if(result && path && nvmtl_is_spirv(result))
+        nvmtl_recipe_note(path,@"variant",fn->_air,fn->_stage,@{@"fc":fn->_fc ?: @{},@"samplers":states ?: @{},@"threadgroup":tgLen ?: @{}});
     if(result){if(nvmtl_is_spirv(result))[nvmtl_memo() setObject:result forKey:memoKey cost:result.length];NSData *keep=[result copy];NSString *file=[path copy],*entry=[fn->_fname copy];
         nvmtl_cache_io(^{BOOL stored=file&&[keep writeToFile:file atomically:YES];nvlog("variant cache: miss %s stored=%d",entry.UTF8String,stored);});}
     return result;
@@ -1986,7 +2226,7 @@ NSData *nvmtl_translate_samplers(NVMTLFunction *fn, NSDictionary *states, uint32
     uint8_t *out=NULL;size_t len=0;char e[1024]={0};
     if(xlate_sampler(fn->_air.UTF8String,fn->_stage.UTF8String,s.UTF8String,&out,&len,e,sizeof e)) {if(err)*err=@(e);return nil;}
     NSData *data=[NSData dataWithBytes:out length:len];xlate_free(out,len);
-    if(memoKey && nvmtl_is_spirv(data)){[nvmtl_memo() setObject:data forKey:memoKey cost:data.length];if(path){NSData *keep=[data copy];NSString *file=[path copy];nvmtl_cache_io(^{[keep writeToFile:file atomically:YES];});}}
+    if(memoKey && nvmtl_is_spirv(data)){[nvmtl_memo() setObject:data forKey:memoKey cost:data.length];if(path)nvmtl_recipe_note(path,@"sampler",fn->_air,fn->_stage,@{@"key":s ?: @""});if(path){NSData *keep=[data copy];NSString *file=[path copy];nvmtl_cache_io(^{[keep writeToFile:file atomically:YES];});}}
     return data;
 }
 

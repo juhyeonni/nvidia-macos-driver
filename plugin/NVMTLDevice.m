@@ -640,6 +640,7 @@ static void nvmtl_install_hw_resource_pools(id dev)
     set(dev, NSSelectorFromString(@"setHwResourcePool:count:"), pools, 3);
     nvlog("  hw resource pools: installed 3 (slot 2 + count)");
 }
+void nvmtl_prewarm_kick(void);
 - (instancetype)initWithAcceleratorPort:(mach_port_t)port {
     nvlog("-[NVMTLDevice initWithAcceleratorPort:%u] in %s", port, getprogname());
     self = [super initWithAcceleratorPort:port];
@@ -675,6 +676,7 @@ static void nvmtl_install_hw_resource_pools(id dev)
               NVMTL_U("featureProfile"), NVMTL_U("maxTextureWidth2D"), NVMTL_U("maxComputeTextures"), NVMTL_U("maxComputeBuffers"));
         #undef NVMTL_U
     } else nvlog("limits: -initLimits not found - every table-served limit stays 0 (CoreImage will refuse renders)");
+    nvmtl_prewarm_kick();
     return self;
 }
 
