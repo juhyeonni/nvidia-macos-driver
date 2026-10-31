@@ -639,7 +639,11 @@ static NVMTLStaging *nvmtl_staging(size_t n) {
 }
 int nvmtl_managed_heap_shadow(NVMTLBuffer *b, size_t len) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("NVMTL_MANAGED_HEAP_SHADOW"); on = !(e && e[0] == '0'); }
+    // Not in WindowServer: there it left half of a full-screen client's composited frames without the client's
+    // content (stale-frame test 30-80% undecodable, page 36-46 fps vs 3-9 and 81-85 without it). The cause inside
+    // WindowServer is not found yet; apps keep the heap shadow.
+    if (on < 0) { const char *e = getenv("NVMTL_MANAGED_HEAP_SHADOW");
+        on = !(e && e[0] == '0') && !(getprogname() && !strcmp(getprogname(), "WindowServer")); }
     // 1 MB or less, the size ANGLE uploads map tiles in. A burst of same-size 4 MB buffers dropped and made again (300 per
     // 0.7 s) is served by the pool and the buffer park; as ordinary memory it unmapped and refaulted 1.2 GB per burst, and
     // other processes missed 6-8 frames per 9 s instead of 1-2.
